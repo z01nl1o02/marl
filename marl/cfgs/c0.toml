@@ -1,0 +1,38 @@
+####################################
+# hybrid scheme: heatmap prior + RL refinement (suggestion #12)
+# -----------------------------------------
+# stage 1: train heatmap prior first:
+#   uv run python -m marl.src.main train_heatmap --dataset_root D:/dataset/WFLW \
+#       --epochs 60 --batch_size 8 --lr 1e-3 --out_dir runs/heatmap_prior
+# stage 2: marl training with heatmap init (this config)
+# - agents start at heatmap peaks (+ annealed jitter), RL only refines locally
+# - max_steps=100 is enough: init err ~2-5% vs full-image search before
+
+face_size = 512
+rf_size = 64
+num_episode = 5000
+history_len = 5
+max_steps = 100
+
+batch_size = 64
+reward_scale = 10.0
+
+UNIT_STEP = 0.01
+ACTIONS = [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]]
+
+dataset_size_max = 64
+
+random_init_xy = false
+
+update_steps = 100
+
+shared_patch_encoder = true
+
+target_update_freq = 10
+
+# heatmap prior init
+init_mode = "heatmap"
+heatmap_weights = "runs/heatmap_prior_v2/heatmap_net_best.pth"
+heatmap_init_jitter = 0.02        # initial jitter std (normalized units, ~10px @512)
+heatmap_init_jitter_min = 0.005   # anneal floor (~2.5px)
+heatmap_init_jitter_decay = 0.99  # per-episode decay (~230 episodes to floor)

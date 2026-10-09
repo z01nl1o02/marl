@@ -136,12 +136,16 @@ class MARLEnv:
     def __init__(self, dataset_root: str, split: str, rf_size: int, face_size: int,
                  unit_step: float, actions: list[tuple[float, float]], reward_scale: float = 10.0,
                  history_len: int = 1, dataset_size_max: int | None = None, max_steps: int = 1000,
-                 random_init_xy: bool = True):
+                 random_init_xy: bool = True, init_provider=None, init_jitter: float = 0.0):
         self.UNIT_STEP = unit_step
         self.ACTIONS = actions
 
         self.flag_train = True if split.lower() == "train" else False
         self.random_init_xy = random_init_xy
+        # hybrid scheme: heatmap prior init. init_provider(image_bgr) -> (n, 2) normalized xy
+        self.init_provider = init_provider
+        self.init_jitter = init_jitter
+        self.last_init_err = float("nan")  # mean init-to-target distance (before jitter)
 
         self.history_len = history_len
         self.dataset = DatasetWFLW(dataset_root, split=split, dataset_size_max=dataset_size_max, face_size=face_size)
@@ -216,7 +220,15 @@ class MARLEnv:
         self.current_image = image_data
         self.xy_targets = label_data
         pad_size = self.rf_size
-        if self.random_init_xy:
+        if self.init_provider is not None:  # heatmap prior init: start near predicted peaks
+            xy_init = np.asarray(self.init_provider(image_data), dtype=np.float32)
+            assert xy_init.shape == (self.num_agents, 2)
+            self.last_init_err = float(np.mean(np.linalg.norm(xy_init - self.xy_targets, axis=-1)))
+            if self.flag_train and self.init_jitter > 0:  # jitter curriculum: RL learns to correct residual error
+                xy_init = xy_init + np.random.normal(0.0, self.init_jitter, xy_init.shape).astype(np.float32)
+                xy_init = np.clip(xy_init, 0.0, 1.0)
+            self.xy_agents = xy_init
+        elif self.random_init_xy:
             self.xy_agents = self._random_init_xy()
         else:
             self.xy_agents = label_data_init # avoid constant init location
@@ -443,9 +455,13 @@ class Agent:
                 nx, ny = int(self.W * (ACTIONS[i_action][0] + x)), int(self.H * (ACTIONS[i_action][1] + y))
                 visits.append(self.explorer.get_visit((nx, ny)))
                 xys.append((nx, ny))
-            visits = np.nan_to_num(visits, 100 * np.max(visits)).tolist()
-            p = [v / sum(visits) for v in visits]
-            i_action = np.random.choice(np.arange(self.n_actions), size=1, p=p, replace=False).item()
+            visits = np.nan_to_num(np.asarray(visits, dtype=np.float64), nan=0.0)
+            total = visits.sum()
+            if total <= 0.0:  # all candidates out of range (e.g. agent at image corner): uniform random
+                i_action = random.randrange(self.n_actions)
+            else:
+                p = (visits / total).tolist()
+                i_action = np.random.choice(np.arange(self.n_actions), size=1, p=p, replace=False).item()
             self.explorer.set_visit(xys[i_action])
             return i_action
         else:
@@ -512,7 +528,7 @@ class MARLBase:
 
     def load(self, path):
         with open(path, 'rb') as f:
-            states = torch.load(f, map_location=self.device)
+            states = torch.load(f, map_location=self.device, weights_only=False)  # ckpt pickles ReplayBuffer objects
         for agent in self.agents:
             agent.target_net.load_state_dict(states[f"agent{agent.agent_id}_target_net"])
             agent.policy_net.load_state_dict(states[f"agent{agent.agent_id}_policy_net"])
@@ -665,6 +681,12 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     update_steps = cfg.get("update_steps", 100)
     shared_patch_encoder = cfg.get("shared_patch_encoder", True)
     target_update_freq = cfg.get("target_update_freq", 10)
+    # hybrid scheme: heatmap prior init + RL refinement
+    init_mode = cfg.get("init_mode", "center")  # center | heatmap
+    heatmap_weights = cfg.get("heatmap_weights", None)
+    heatmap_init_jitter = cfg.get("heatmap_init_jitter", 0.0)  # initial jitter std (normalized)
+    heatmap_init_jitter_min = cfg.get("heatmap_init_jitter_min", 0.0)
+    heatmap_init_jitter_decay = cfg.get("heatmap_init_jitter_decay", 1.0)  # per-episode multiplicative decay
     
     ACTIONS = []
     for (x, y) in ACTIONS_rel:
@@ -710,6 +732,18 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     )
     logger.info(f"dataset size: train {len(env_tr)} | test {len(env_te)}")
 
+    if init_mode == "heatmap":
+        assert heatmap_weights is not None and os.path.exists(heatmap_weights), \
+            f"init_mode=heatmap requires heatmap_weights, got: {heatmap_weights}"
+        from marl.src.heatmap import load_heatmap_provider
+        init_provider = load_heatmap_provider(heatmap_weights, num_points=env_tr.get_point_num(),
+                                              face_size=face_size, device=device)
+        env_tr.init_provider = init_provider
+        env_te.init_provider = init_provider
+        env_tr.init_jitter = heatmap_init_jitter  # eval env: no jitter, measure raw prior quality
+        logger.info(f"init_mode=heatmap | weights: {heatmap_weights} | "
+                    f"init_jitter(tr): {heatmap_init_jitter} (min {heatmap_init_jitter_min}, decay {heatmap_init_jitter_decay})")
+
     if weights_file is not None:
         trainer.load(weights_file)
         logger.warning(f"loading weights from {weights_file}")
@@ -717,6 +751,8 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     top_eval_metric = np.finfo("float").min
     for episode in range(num_episode):
         trainer.episode_count = episode
+        if init_mode == "heatmap":  # anneal init jitter: coarse correction -> fine correction
+            env_tr.init_jitter = max(heatmap_init_jitter_min, heatmap_init_jitter * (heatmap_init_jitter_decay ** episode))
         episode_info = trainer.run_episode(env_tr, max_steps_collected=max_steps*10, 
                                            batch_size=batch_size, update_steps=update_steps,
                                            target_update_freq=target_update_freq)
@@ -731,7 +767,9 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
             success_stat = evaluater.stat_success(env_te)
             summary_writer.add_scalar("eval/success/all", success_stat['all'], episode)
             summary_writer.add_scalar("eval/success/agents", success_stat['agents'], episode)
-            logger.info(f"Episode {episode}|loss: {episode_info['loss']}|ent: {episode_info['entropy']}|eval sucess: {success_stat['agents']}")
+            summary_writer.add_scalar("eval/init_err", success_stat['init_err'], episode)
+            logger.info(f"Episode {episode}|loss: {episode_info['loss']}|ent: {episode_info['entropy']}|"
+                        f"eval sucess: {success_stat['agents']}|init_err: {success_stat['init_err']:.4f}")
             if success_stat['agents'] > top_eval_metric:
                 top_eval_metric = success_stat['agents']
                 logger.info(f"NEW BEST MODEL! Episode {episode}|eval success: {success_stat['agents']}")
@@ -750,12 +788,14 @@ class MARLEval(MARLBase):
                          device=device,
                          use_weight_sharing=use_weight_sharing, flag_train=False)
     def stat_success(self, env) -> dict:
-        success_stat = {"all":[], "agents":[]}
+        success_stat = {"all":[], "agents":[], "init_err":[]}
         for i_episode in range(len(env)):
             info = self.run_episode(env)
             success_stat['all'].append(info['success'])
             success_stat['agents'].append(info['success_agents'])
-        return {"all": np.mean(success_stat['all']), "agents": np.mean(success_stat['agents'])}
+            success_stat['init_err'].append(info['init_err'])
+        return {"all": np.mean(success_stat['all']), "agents": np.mean(success_stat['agents']),
+                "init_err": float(np.mean(success_stat['init_err']))}
 
     def run_episode(self, env):
         # 重置环境，获取初始状态列表 [state_0, state_1, ..., state_k]
@@ -815,7 +855,8 @@ class MARLEval(MARLBase):
             "reward_std": np.std(rewards_all, axis=0),
             "dxdy": dxdy_all,
             "success": success,
-            "success_agents": success_agents
+            "success_agents": success_agents,
+            "init_err": getattr(env, "last_init_err", float("nan"))
             } 
         return eval_info
 
@@ -836,6 +877,8 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     dataset_size_max = cfg.get("dataset_size_max", None)
     random_init_xy = cfg.get("random_init_xy", True)
     shared_patch_encoder = cfg.get("shared_patch_encoder", True)
+    init_mode = cfg.get("init_mode", "center")
+    heatmap_weights = cfg.get("heatmap_weights", None)
     
     ACTIONS = []
     for (x, y) in ACTIONS_rel:
@@ -868,6 +911,13 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
         )
     logger.info(f"dataset size {len(env)}")
 
+    if init_mode == "heatmap":
+        assert heatmap_weights is not None and os.path.exists(heatmap_weights)
+        from marl.src.heatmap import load_heatmap_provider
+        env.init_provider = load_heatmap_provider(heatmap_weights, num_points=env.get_point_num(),
+                                                  face_size=face_size, device=device)
+        logger.info(f"init_mode=heatmap | weights: {heatmap_weights}")
+
     eval.load(weights_file)
     logger.warning(f"loading weights from {weights_file}")
     
@@ -878,7 +928,12 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
         cv2.imwrite(os.path.join(outdir, f"{episode:0>8d}.jpg"), episode_info['visual_data'])
     
 if __name__ == "__main__":
+    def train_heatmap_entry(*args, **kwargs):
+        from marl.src.heatmap import train_heatmap
+        return train_heatmap(*args, **kwargs)
+
     Fire(
-        {"train": train, 
-         "test": test
+        {"train": train,
+         "test": test,
+         "train_heatmap": train_heatmap_entry,
          })
