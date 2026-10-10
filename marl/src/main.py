@@ -1,4 +1,20 @@
-import os
+"""
+TODO:
+1. 比对 c0-VS-b1
+2. 实现"课程"
+3. 支持seed,确保实验可复现
+------------------------------------------------------
+c0.toml
+    - [x] 支持广度优先和深度优先agent_action_selection_mode
+    - [x] ACTION支持[0,0], 允许agent保持原地静止
+    - [x] freezing_success_agent 允许已经到达目标位置的agent停止更新replay和位置
+    - [ ] 把参数分层
+    - [ ] 支持"课程", 先放宽"成功"的定义,当成功率足够高以后再逐渐提高"成功"质量
+    
+"""
+
+
+import os,sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -27,6 +43,31 @@ import gc
 #    2: (0.0, UNIT_STEP),
 #    3: (0.0, -UNIT_STEP),
 #    }
+
+SAVE_REPLAY_BUFFER = False # 保存repaly buffer需要较多内存
+
+class ReplayBuffer:
+    def __init__(self, capacity=10000):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        
+        # 转换为Tensor
+        states = torch.FloatTensor(np.array(states))
+        actions = torch.LongTensor(actions).unsqueeze(1)
+        rewards = torch.FloatTensor(rewards).unsqueeze(1)
+        next_states = torch.FloatTensor(np.array(next_states))
+        dones = torch.FloatTensor(dones).unsqueeze(1)
+        
+        return states, actions, rewards, next_states, dones
+
+    def __len__(self):
+        return len(self.buffer)
 
 class DatasetWFLW:
     # https://wywu.github.io/dataset/
@@ -134,12 +175,15 @@ class DatasetWFLW:
 
 class MARLEnv:
     def __init__(self, dataset_root: str, split: str, rf_size: int, face_size: int,
-                 unit_step: float, actions: list[tuple[float, float]], reward_scale: float = 10.0,
+                 unit_step: float, actions: list[tuple[float, float]], 
+                 use_abs_dist_as_reward:bool,
+                 reward_scale: float = 10.0,
                  history_len: int = 1, dataset_size_max: int | None = None, max_steps: int = 1000,
                  random_init_xy: bool = True):
         self.UNIT_STEP = unit_step
         self.ACTIONS = actions
 
+        self.use_abs_dist_as_reward = use_abs_dist_as_reward
         self.flag_train = True if split.lower() == "train" else False
         self.random_init_xy = random_init_xy
 
@@ -263,10 +307,12 @@ class MARLEnv:
         obs_data = np.concatenate(obs_all, axis=0)
         return obs_data.copy() 
 
-    def _take_actions(self, actions: list[int]) -> None:
+    def _take_actions(self, actions: list[int|None]) -> None:
         assert len(actions) == self.num_agents
         assert self.current_image is not None
         for i_agent, i_action in enumerate(actions):
+            if i_agent < 0:
+                continue # 输入 -1,表示不再移动agent
             x = self.xy_agents[i_agent, 0] + self.ACTIONS[i_action][0]
             y = self.xy_agents[i_agent, 1] + self.ACTIONS[i_action][1]
             x = min(max(x, 0.0), 1.0)
@@ -280,29 +326,37 @@ class MARLEnv:
         return: (observation, reward, play_end, aux_info)
         """
         self.num_steps += 1
-        #xy_agents_old = np.copy(self.xy_agents)
+        xy_agents_old = np.copy(self.xy_agents)
         self._take_actions(actions)
         xy_agents_new = self.xy_agents
 
         obs_new = self.get_observation()
         assert self.xy_targets is not None
         dist_new = np.linalg.norm(self.xy_targets - xy_agents_new,  axis=-1, ord=2)
-        #dist_old = np.linalg.norm(self.xy_targets - xy_agents_old, axis=-1, ord=2)
+        dist_old = np.linalg.norm(self.xy_targets - xy_agents_old, axis=-1, ord=2)
 
-        #reward = (dist_old - dist_new) * self.reward_scale  #reward shaping    
-        reward = 1 - dist_new * self.reward_scale / 1.0
 
-        flag_success = np.all(dist_new < self.UNIT_STEP)
+        if self.use_abs_dist_as_reward:
+            reward = 1 - dist_new * self.reward_scale / 1.0 # 使用绝对量做reward, 需要仔细设计避免被agent发现 "捷径"
+        else:
+            reward = (dist_old - dist_new) * self.reward_scale  #reward shaping    
+
+        success_mask = [dist_new[i] < self.UNIT_STEP for i in range(self.num_agents)]
+        flag_success = np.all(success_mask) 
+            
         if flag_success:
             return obs_new, reward, [True]*self.num_agents, {"success": True, "num_steps": self.num_steps, 
-                                                             "success_agents": np.mean(dist_new < self.UNIT_STEP)} 
+                                                             "success_agents": np.mean(dist_new < self.UNIT_STEP),
+                                                             "success_agent_mask":success_mask} 
         
         if self.num_steps >= self.max_steps:
             return obs_new, reward, [True]*self.num_agents, {"success": False, "num_steps": self.num_steps, 
-                                                             "success_agents": np.mean(dist_new < self.UNIT_STEP)} 
+                                                             "success_agents": np.mean(dist_new < self.UNIT_STEP),
+                                                             "success_agent_mask":success_mask} 
         
         return obs_new, reward, [False]*self.num_agents, {"success": False, "num_steps": self.num_steps,
-                                                          "success_agents": np.mean(dist_new < self.UNIT_STEP)} 
+                                                          "success_agents": np.mean(dist_new < self.UNIT_STEP),
+                                                          "success_agent_mask":success_mask} 
 
 class PatchEncoder(nn.Module):
     def __init__(self, shape_input: tuple[int, int, int, int]) -> None:
@@ -341,34 +395,6 @@ class CollabDQN(nn.Module):
         return self.head(x)
     
 
-class ReplayBuffer:
-    def __init__(self, capacity=10000):
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, state, action, reward, next_state, done):
-
-#        if isinstance(state, np.ndarray):
-#            state = state.copy()
-#        if isinstance(next_state, np.ndarray):
-#            next_state = next_state.copy() #avoid memory leak
-
-        self.buffer.append((state, action, reward, next_state, done))
-
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-        
-        # 转换为Tensor
-        states = torch.FloatTensor(np.array(states))
-        actions = torch.LongTensor(actions).unsqueeze(1)
-        rewards = torch.FloatTensor(rewards).unsqueeze(1)
-        next_states = torch.FloatTensor(np.array(next_states))
-        dones = torch.FloatTensor(dones).unsqueeze(1)
-        
-        return states, actions, rewards, next_states, dones
-
-    def __len__(self):
-        return len(self.buffer)
 
 # =======================
 # 3. agents
@@ -402,10 +428,13 @@ class Explorer:
         
 
 class Agent:
-    def __init__(self, agent_id, input_shape, n_actions, lr=1e-4, gamma=0.99, 
+    def __init__(self, agent_id, input_shape, n_actions, 
+                 agent_action_selection_mode:str,
+                 lr=1e-4, gamma=0.99, 
                  device: str = "cuda:0",
                  epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.01, 
-                 shared_patch_encoder: PatchEncoder | None = None, flag_train: bool = True):
+                 shared_patch_encoder: PatchEncoder | None = None, 
+                 flag_train: bool = True):
         """
         Args:
             shared_policy_net: 如果共享权重，传入共享的网络对象
@@ -418,6 +447,7 @@ class Agent:
         self.epsilon = epsilon
         self.epsilon_decay = epsilon_decay
         self.epsilon_min = epsilon_min
+        self.agent_action_selection_mode = agent_action_selection_mode
 
         self.replay_buffer = ReplayBuffer(capacity=4096)  # eat up memory!!!
 
@@ -444,7 +474,13 @@ class Agent:
                 visits.append(self.explorer.get_visit((nx, ny)))
                 xys.append((nx, ny))
             visits = np.nan_to_num(visits, 100 * np.max(visits)).tolist()
-            p = [v / sum(visits) for v in visits]
+            total = sum(visits)
+            if self.agent_action_selection_mode.lower() == "dfs":
+                p = [v / total for v in visits] # 深度优先
+            else:
+                p = [(total -  v) / total for v in visits] # 广度优先
+                t = np.sum(p)
+                p = [v / t for v in p] 
             i_action = np.random.choice(np.arange(self.n_actions), size=1, p=p, replace=False).item()
             self.explorer.set_visit(xys[i_action])
             return i_action
@@ -469,7 +505,10 @@ class Agent:
 # =======================
 class MARLBase:
     def __init__(self, num_agents, input_shape, n_actions, 
-                 device: str = "cuda:0", use_weight_sharing=False, flag_train=True):
+                 agent_action_selection_mode:str,
+                 device: str = "cuda:0", 
+                 use_weight_sharing=False, 
+                 flag_train=True):
 
         self.episode_count = 0
         self.device = torch.device(device)
@@ -493,7 +532,8 @@ class MARLBase:
                 n_actions=n_actions,
                 device=device,
                 shared_patch_encoder=self.shared_patch_encoder,
-                flag_train=flag_train
+                flag_train=flag_train,
+                agent_action_selection_mode=agent_action_selection_mode
             )
             self.agents.append(agent)
             
@@ -504,9 +544,13 @@ class MARLBase:
             states.update(
                 {f"agent{agent.agent_id}_target_net": agent.target_net.state_dict(),
                  f"agent{agent.agent_id}_policy_net": agent.policy_net.state_dict(),
-                 f"agent{agent.agent_id}_replay": agent.replay_buffer
                  }
             )
+            if SAVE_REPLAY_BUFFER:
+                states.update( 
+                 {f"agent{agent.agent_id}_replay": agent.replay_buffer}
+                )
+                print(f"save agent {agent.agent_id}. replay buffer: {len(agent.replay_buffer)}")
         torch.save(states, path)
         return
 
@@ -516,7 +560,8 @@ class MARLBase:
         for agent in self.agents:
             agent.target_net.load_state_dict(states[f"agent{agent.agent_id}_target_net"])
             agent.policy_net.load_state_dict(states[f"agent{agent.agent_id}_policy_net"])
-            agent.replay_buffer = states[f"agent{agent.agent_id}_replay"]
+            if SAVE_REPLAY_BUFFER:
+                agent.replay_buffer = states[f"agent{agent.agent_id}_replay"]
 
         if self.shared_patch_encoder is not None:
             self.shared_patch_encoder.load_state_dict(self.agents[0].policy_net.patch_encoder.state_dict())
@@ -525,13 +570,16 @@ class MARLBase:
         return
 
 class MARLTrain(MARLBase):
-    def __init__(self, num_agents, input_shape, n_actions, 
-                 device: str = "cuda:0", use_weight_sharing=False):
+    def __init__(self, num_agents, input_shape, n_actions, agent_action_selection_mode:str,
+                 device: str = "cuda:0", use_weight_sharing=False, 
+                 freezing_success_agent=False):
         super().__init__(num_agents=num_agents, 
                          input_shape=input_shape, 
                          n_actions=n_actions,
                          device=device,
-                         use_weight_sharing=use_weight_sharing, flag_train=True)
+                         use_weight_sharing=use_weight_sharing, flag_train=True,
+                         agent_action_selection_mode=agent_action_selection_mode)
+        self.freezing_success_agent = freezing_success_agent
     def train_step(self, batch_size: int = 64, update_steps: int = 100)->dict:
         """
         执行一次梯度更新。
@@ -579,18 +627,25 @@ class MARLTrain(MARLBase):
         actions_all = []
         visual_data_all = [env.get_visual_data()]
         rewards_all = []
+        success_agent_mask = [False for _ in range(self.num_agents)]
         while len(rewards_all) <= max_steps_collected:
             while True:
                 actions = []
                 # 1. 并行选择动作
                 for i, agent in enumerate(self.agents):
-                    action = agent.select_action(states[i], env.xy_agents[i], env.ACTIONS)
+                    if success_agent_mask[i]:
+                        action = -1 # diable move
+                    else:
+                        action = agent.select_action(states[i], env.xy_agents[i], env.ACTIONS)
                     actions.append(action)
                 actions_all.append(np.array(actions).astype(np.int32).reshape(1, -1))
                 
                 # 2. 执行动作，与环境交互
                 # env.step 应返回: next_states, rewards, dones
                 next_states, rewards, dones, info = env.step(actions)
+                
+                if self.freezing_success_agent:
+                    success_agent_mask = [success_agent_mask[i] or info['success_agent_mask'][i] for i in range(self.num_agents)]
 
                 if False:
                     for i_agent in range(next_states.shape[0]):
@@ -603,8 +658,14 @@ class MARLTrain(MARLBase):
                 visual_data_all += [env.get_visual_data()]
                 rewards_all.append(np.array(rewards).astype(np.float32).reshape(1, -1))
                 # 3. 存储经验到缓冲区
-                for i, agent in enumerate(self.agents):
-                    agent.replay_buffer.push(states[i], actions[i], rewards[i], next_states[i], dones[i])
+                if self.freezing_success_agent:
+                    for i, agent in enumerate(self.agents):
+                        if success_agent_mask[i]:
+                            continue # 已经达到目标位置的agent不再更新对应的replay buffer, 保持当前样本集
+                        agent.replay_buffer.push(states[i], actions[i], rewards[i], next_states[i], dones[i])
+                else:
+                    for i, agent in enumerate(self.agents):
+                        agent.replay_buffer.push(states[i], actions[i], rewards[i], next_states[i], dones[i])
 
                 states = next_states
                 
@@ -665,7 +726,11 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     update_steps = cfg.get("update_steps", 100)
     shared_patch_encoder = cfg.get("shared_patch_encoder", True)
     target_update_freq = cfg.get("target_update_freq", 10)
-    
+    agent_action_selection_mode = cfg.get("agent_action_selection_mode", "dfs")
+    use_abs_dist_as_reward = cfg.get("use_abs_dist_as_reward",True) 
+    # freezing_success_agent: 已经达到目标的agent不再更新replay buffer, 不再移动, 但依然参与训练(避免震荡)
+    freezing_success_agent = cfg.get("training",{}).get("freezing_success_agent",False)
+     
     ACTIONS = []
     for (x, y) in ACTIONS_rel:
         ACTIONS.append((x*UNIT_STEP, y*UNIT_STEP))
@@ -682,6 +747,8 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     logger.info(f"saved folder {outdir}")
     logger.info(f"ACTIONS: {ACTIONS}")
     logger.info(f"UNIT in pixel: {int(UNIT_STEP * face_size)}")
+    logger.info(f"agent action selection model: {agent_action_selection_mode}")
+    logger.info(f"use_abs_dist_as_reward: {use_abs_dist_as_reward}")
 
     assert face_size * UNIT_STEP > 1.0
     input_channels = 3 * history_len
@@ -690,23 +757,26 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     logger.info(f"face size: {face_size}") 
     env_tr = MARLEnv(dataset_root, split="train", face_size=face_size, rf_size=rf_size, history_len=history_len, unit_step=UNIT_STEP,
                      actions=ACTIONS, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
-                     max_steps=max_steps, random_init_xy=random_init_xy)
+                     max_steps=max_steps, random_init_xy=random_init_xy,use_abs_dist_as_reward=use_abs_dist_as_reward)
     env_te = MARLEnv(dataset_root, split="test", face_size=face_size, rf_size=rf_size, history_len=history_len, unit_step=UNIT_STEP,
                      actions=ACTIONS, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
-                     max_steps=max_steps, random_init_xy=random_init_xy)
+                     max_steps=max_steps, random_init_xy=random_init_xy,use_abs_dist_as_reward=use_abs_dist_as_reward)
     trainer = MARLTrain(
         num_agents=env_tr.num_agents,
         input_shape=input_shape,
         n_actions=n_actions,
         device=device,
-        use_weight_sharing=shared_patch_encoder  # Collab-DQN 
+        agent_action_selection_mode=agent_action_selection_mode,
+        use_weight_sharing=shared_patch_encoder,  # Collab-DQN 
+        freezing_success_agent=freezing_success_agent
     )
     evaluater = MARLEval(
         num_agents=env_tr.num_agents,
         input_shape=input_shape,
         n_actions=n_actions,
         device=device,
-        use_weight_sharing=shared_patch_encoder  # Collab-DQN 
+        use_weight_sharing=shared_patch_encoder,  # Collab-DQN 
+        agent_action_selection_mode=agent_action_selection_mode
     )
     logger.info(f"dataset size: train {len(env_tr)} | test {len(env_te)}")
 
@@ -742,13 +812,14 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     summary_writer.close()
 
 class MARLEval(MARLBase):
-    def __init__(self, num_agents, input_shape, n_actions, 
+    def __init__(self, num_agents, input_shape, n_actions, agent_action_selection_mode:str,
                  device: str = "cuda:0", use_weight_sharing=False):
         super().__init__(num_agents=num_agents, 
                          input_shape=input_shape, 
                          n_actions=n_actions,
                          device=device,
-                         use_weight_sharing=use_weight_sharing, flag_train=False)
+                         use_weight_sharing=use_weight_sharing, flag_train=False,
+                         agent_action_selection_mode=agent_action_selection_mode)
     def stat_success(self, env) -> dict:
         success_stat = {"all":[], "agents":[]}
         for i_episode in range(len(env)):
@@ -836,6 +907,7 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     dataset_size_max = cfg.get("dataset_size_max", None)
     random_init_xy = cfg.get("random_init_xy", True)
     shared_patch_encoder = cfg.get("shared_patch_encoder", True)
+    use_abs_dist_as_reward = cfg.get("use_abs_dist_as_reward",True) 
     
     ACTIONS = []
     for (x, y) in ACTIONS_rel:
@@ -849,6 +921,7 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     logger.info(f"ACTIONS: {ACTIONS}")
     logger.info(f"UNIT in pixel: {int(UNIT_STEP * face_size)}")
     logger.info(f"dataset: {dataset_root}")
+    logger.info(f"use_abs_dist_as_reward: {use_abs_dist_as_reward}")
 
     assert face_size * UNIT_STEP > 1.0
     input_channels = 3 * history_len
@@ -858,7 +931,8 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     env = MARLEnv(dataset_root, split="test", face_size=face_size,
                   rf_size=rf_size, history_len=history_len, unit_step=UNIT_STEP,
                   actions=ACTIONS, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
-                  max_steps=max_steps, random_init_xy=random_init_xy)
+                  max_steps=max_steps, random_init_xy=random_init_xy, 
+                  use_abs_dist_as_reward=use_abs_dist_as_reward)
     eval = MARLEval(
         num_agents=env.num_agents,
         input_shape=input_shape,
