@@ -7,11 +7,16 @@
 - [ ] 把参数分层
 - [x] 支持"课程", 先放宽"成功"的定义,当成功率足够高以后再逐渐提高"成功"质量
 - [ ] 退火 epsilon 替代动作选择
+- [ ] 按照更新次数对epsilon做退火，不要基于采样轮次做退火
 - [x] 分析select_action是否能覆盖解空间   
 - [x] 支持seed, 确保结果可复现
 - [ ] Double DQN
 - [ ] target network软跟新: Polyak
 - [ ] 验证history_len对训练的影响
+- [ ] 共享embeddding层,只用一个Optimizer做更新共享层(使用多个agent对应loss的均值做backward)
+- [ ] replay buffer中obs采用uint8存储
+- [ ] replay buffer中不要直接存储obs, 而是obs的索引，避免重复的帧被多次存储
+- [ ] replay buffer中存储image path + 坐标，动态生成obs
 
 -------------------------------------------
 1. online network每次更新抽取~0.25的新增样本即可
@@ -512,7 +517,7 @@ class Agent:
                  replay_buffer_size:int,
                  lr=1e-3, # adam
                  device: str = "cuda:0",
-                 epsilon=0.6, epsilon_decay=0.99, epsilon_min=0.05, 
+                 epsilon=0.6, epsilon_decay=0.8, epsilon_min=0.05, 
                  shared_patch_encoder: PatchEncoder | None = None, 
                  flag_train: bool = True):
         """
@@ -524,7 +529,7 @@ class Agent:
         self.agent_id = agent_id
         self.n_actions = n_actions
         self.epsilon = epsilon
-        self.epsilon_decay = epsilon_decay
+        self.epsilon_decay = epsilon_decay # 0.8^(20) = 0.011
         self.epsilon_min = epsilon_min
         self.agent_action_selection_mode = agent_action_selection_mode
 
@@ -796,6 +801,8 @@ class MARLTrain(MARLBase):
         for agent in self.agents:
             if agent.epsilon > agent.epsilon_min:
                 agent.epsilon *= agent.epsilon_decay
+            else:
+                agent.epsilon = agent.epsilon_min
                 
         # 6. 定期更新目标网络
         if hasattr(self, 'episode_count'):
