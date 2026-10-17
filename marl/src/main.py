@@ -2,22 +2,22 @@
 测试配置 c1.toml
 
 - [x] 支持广度优先和深度优先agent_action_selection_mode
-- [x] ACTION支持[0,0], 允许agent保持原地静止
-- [x] freezing_success_agent 允许已经到达目标位置的agent停止更新replay和位置
+- [x] ACTION支持[0,0], 允许 agent 保持原地静止
+- [x] freezing_success_agent 允许已经到达目标位置的 agent 停止更新replay和位置
 - [ ] 把参数分层
 - [x] 支持"课程", 先放宽"成功"的定义,当成功率足够高以后再逐渐提高"成功"质量
 - [ ] 退火 epsilon 替代动作选择
-- [ ] 按照更新次数对epsilon做退火，不要基于采样轮次做退火
-- [x] 分析select_action是否能覆盖解空间   
+- [ ] 按照更新次数对epsilon做退火,不要基于采样轮次做退火
+- [x] 分析 select_action 是否能覆盖解空间   
 - [x] 支持seed, 确保结果可复现
 - [ ] Double DQN
 - [ ] target network软跟新: Polyak
 - [ ] 验证history_len对训练的影响
-- [ ] 共享embeddding层,只用一个Optimizer做更新共享层(使用多个agent对应loss的均值做backward)
-- [ ] replay buffer中obs采用uint8存储
-- [ ] replay buffer中不要直接存储obs, 而是obs的索引，避免重复的帧被多次存储
-- [ ] replay buffer中存储image path + 坐标，动态生成obs
-
+- [x] 使用mean face优化初始位置
+- [x] 共享embeddding层,只用一个Optimizer做更新共享层(使用多个 agent 对应 loss 的均值做backward)
+- [x] replay buffer中不要直接存储obs, 而是obs的索引，避免重复的帧被多次存储
+- [ ] replay buffer中存储image path + 坐标，动态生成obs deperated
+- [ ] replay buffer中obs采用uint8存储. deperated
 -------------------------------------------
 1. online network每次更新抽取~0.25的新增样本即可
 2. BFS/DFS/random对于selection action差异不大
@@ -50,14 +50,14 @@ from typing import Iterable
 SAVE_REPLAY_BUFFER = False # 保存repaly buffer需要较多内存
 
 
-def set_seed(seed:int):
+def set_seed(seed:int) -> np.random.Generator:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.benchmark=False
     torch.backends.cudnn.deterministic=True
     np.random.seed(seed)
-    return 
+    return np.random.default_rng(seed)
 
 
 def _format_container(obj, width=8, precision=4):
@@ -92,45 +92,93 @@ def _calc_percentile(data:Iterable, P = (25,50,75,90)):
 
 
 class ReplayBuffer:
-    def __init__(self, capacity=10000):
+    def __init__(self, capacity=10000, rng:None|np.random.Generator = None):
         self.buffer = deque(maxlen=capacity)
+        self.image_pool:dict[int, dict] = {}
+        self.rng = rng if rng else np.random.default_rng(42)
 
-    def push(self, state, action, reward, next_state, done):
-         # 转换为Tensor
-        state = torch.FloatTensor(np.array(state)).unsqueeze(0)
+    def push(self, 
+             state,state_xy, 
+             action, reward, 
+             next_state,  next_state_xy,
+             done, 
+             image_id:int, 
+             image:np.ndarray, 
+             rf_size:int):
+        
+        if image_id not in self.image_pool:
+            self.image_pool[image_id] = {"image":image.copy(), "rf_size":rf_size}
+        
+        
+        #state = torch.FloatTensor(np.array(state)).unsqueeze(0)
+        state = state_xy.copy()
+        
         action = torch.LongTensor(np.array([action])).unsqueeze(0)
+        
         reward = torch.FloatTensor(np.array([reward])).unsqueeze(0)
-        next_state = torch.FloatTensor(np.array(next_state)).unsqueeze(0)
+        
+        #next_state = torch.FloatTensor(np.array(next_state)).unsqueeze(0)
+        next_state = next_state_xy.copy()
+        
         done = torch.FloatTensor(np.array([1 if done else 0])).unsqueeze(0)
         
-        self.buffer.append((state, action, reward, next_state, done))
+        self.buffer.append((image_id,state, action, reward, next_state, done))
 
     def stat(self) -> dict[str,dict]:
         rewards_all, dones_all, actions_all = [], [], []
-        for s,a,r,ns,d in self.buffer:
+        for i,s,a,r,ns,d in self.buffer:
             rewards_all.append(r.item())
             dones_all.append(int(d.item()))
             actions_all.append(a.item())
         return {
             "total": len(self.buffer),
             "reward": _calc_percentile(rewards_all),
-            "done": dict(Counter(dones_all))
+            "done": dict(Counter(dones_all)),
+            "image_pool": len(self.image_pool.keys())
         } 
-            
+    
+    def _recover_states(self, image_ids:list[int],states_xy:list[np.ndarray]) -> list[np.ndarray]:
+        states_all =  []
+        for image_id, state_xy in zip(image_ids, states_xy):
+            rf_size = self.image_pool[image_id]["rf_size"]
+            env = MARLEnvSim(self.image_pool[image_id]['image'], rf_size)
+            # HINT:
+            # state_xy: (history_len, 2)
+            # state: (history_len*3, rf_size, rf_size)
+            history_len, _ = state_xy.shape
+            states = np.zeros((history_len*3, rf_size, rf_size),dtype=np.float32)
+            state_xy = state_xy.reshape(-1,2)
+            for ixy in range(state_xy.shape[0]):
+                x,y = state_xy[ixy]
+                data = env._crop_roi((x, y))
+                data = np.transpose(data, (2, 0, 1))
+                states[ixy*3:(ixy+1)*3] = data
+            states_all.append(states[None]) 
+        return states_all
          
         
-    def sample(self, batch_size):
+    def sample(self, batch_size)->tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,torch.Tensor, dict]:
         if batch_size > len(self.buffer):
-            return (None,) * 5
-        batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
+            return (None,) * 6
+        indices = self.rng.choice(len(self.buffer), size=batch_size, replace=True)
+        batch = [self.buffer[i] for i in indices]
         
-        states = torch.concat(states,dim=0)
+        image_ids, states_xy, actions, rewards, next_states_xy, dones = zip(*batch)
+        
+        states = self._recover_states(image_ids, states_xy)
+        states = np.concat(states,axis=0)
+        states = torch.from_numpy(states)
+        
         actions = torch.concat(actions,dim=0)
+        
         rewards = torch.concat(rewards,dim=0)
-        next_states = torch.concat(next_states,dim=0)
+        
+        next_states = self._recover_states(image_ids, next_states_xy)
+        next_states = np.concat(next_states, axis=0)
+        next_states = torch.from_numpy(next_states)
+        
         dones = torch.concat(dones,dim=0)
-        return states, actions, rewards, next_states, dones
+        return states, actions, rewards, next_states, dones, {"indices":indices.copy()}
 
     def __len__(self):
         return len(self.buffer)
@@ -162,6 +210,7 @@ class DatasetWFLW:
                 images_info = pickle.load(f)
         else:
             images_info = {}
+        self.meanface = np.zeros((len(points_indices),2),dtype=np.float32)
         with open(annotation_file, 'r') as f:
             for items in tqdm(f, desc="load WFLW..."):
                 items = items.strip()
@@ -215,21 +264,14 @@ class DatasetWFLW:
                     continue
                 XY = [XYall[i].reshape(1, 2) for i in points_indices]
                 XY = np.concatenate(XY, axis=0).astype(np.int32)
-                
-                if 0:
-                    vis = cv2.imread(image_path,1)
-                    for xy in XY:
-                        cv2.circle(vis,xy,5, (0,255,0),3)
-                    cv2.rectangle(vis,face_bbox[0:2], face_bbox[2:], (0,0,255),4)
-                    cv2.imshow("background",vis)
-                    cv2.waitKey(5000)
+                self.meanface += (XY - np.array([face_bbox[0], face_bbox[1]]).reshape(1,2)) / np.array([face_bbox[2]-face_bbox[0], face_bbox[3]-face_bbox[1]],dtype=np.float32).reshape(1,2)
                 self.dataset.append(
                     {"image": image_path, "face_bbox": face_bbox, "points": XY}
                 )
                 
                 if dataset_size_max is not None and len(self.dataset) >= dataset_size_max:
                     break
-                
+        self.meanface /= len(self.dataset)       
         with open(cache_file, 'wb') as f:
             pickle.dump(images_info, f)
         return
@@ -255,13 +297,51 @@ class DatasetWFLW:
             face_image = cv2.resize(face_image, [self.face_size, self.face_size], interpolation=cv2.INTER_LINEAR)
             face_kpts = (face_kpts * np.array([sx,sy]).reshape(1,2)).astype(np.int32)
         h,w = face_image.shape[0:2]
-        return face_image, face_kpts, np.repeat(np.array([w//2,h//2]).reshape(1,2),repeats=len(face_kpts),axis=0)
+        return face_image, face_kpts, (self.meanface * np.array([w,h]).reshape(1,2)).astype(np.int32)
+
+class MARLEnvSim:
+    """
+    为了节省replay buffer中存储空间而设计的一个类，允许从坐标值生成obs
+    所有代码逻辑必须和 MARLEnv 保持一致
+    """
+    
+    def __init__(self, image_data:np.ndarray, rf_size:int):
+        self.current_image = image_data.copy()
+        self.rf_size = rf_size
+        self.current_image_patched = self._prepare_current_image()
+    def _prepare_current_image(self) -> None:
+        pad_size = self.rf_size
+        current_image_patched = np.pad(self.current_image, ((pad_size, pad_size), (pad_size, pad_size), (0, 0)),
+                                            constant_values=128, mode="constant")
+        return current_image_patched
+    def _crop_roi(self, xy: tuple[int, int]):
+        
+        assert self.current_image is not None and self.current_image_patched is not None
+        H, W = self.current_image.shape[0:2]
+        nx, ny = xy
+        size = int(self.rf_size)
+        #assert not (nx < 0 or nx > W or ny < 0 or ny > H) # REVIEW: this is different from MARLEnv::_crop_roi()
+        if  nx < 0 or ny < 0:
+            return np.zeros((self.rf_size, self.rf_size, 3),dtype=np.float32)
+  
+        x0 = int(nx - size/2)
+        x1 = x0 + size
+        y0 = int(ny - size/2)
+        y1 = y0 + size
+
+        offset = self.rf_size 
+        roi_data = (self.current_image_patched[y0 + offset:y1 + offset, x0 + offset:x1 + offset] - 128.0)/128.0
+        return roi_data
+
+
+       
 
 class MARLEnv:
     def __init__(self, dataset_root: str, split: str, rf_size: int, face_size: int,
                  actions: list[tuple[float, float]], 
                  target_range_steps: tuple[int],
                  use_abs_dist_as_reward:bool,
+                 rng: np.random.Generator,
                  reward_scale: float = 10.0,
                  history_len: int = 1, dataset_size_max: int | None = None, max_steps: int = 1000,
                  random_init_xy: bool = True):
@@ -273,12 +353,14 @@ class MARLEnv:
         self.use_abs_dist_as_reward = use_abs_dist_as_reward
         self.flag_train = True if split.lower() == "train" else False
         self.random_init_xy = random_init_xy
-
+        
+        self.rng = rng
         self.history_len = history_len
         self.dataset = DatasetWFLW(dataset_root, split=split, dataset_size_max=dataset_size_max, face_size=face_size)
         self.num_agents = self.dataset.get_point_num()
         self.xy_agents = np.zeros((self.num_agents, 2), dtype=np.int32)
         self.history_obs_agents = [deque(maxlen=history_len) for _ in range(self.num_agents)]
+        self.history_xy_agents = [deque(maxlen=history_len) for _ in range(self.num_agents)]
         self.resize_method = cv2.INTER_AREA
 
         self.rf_size = rf_size
@@ -301,6 +383,7 @@ class MARLEnv:
     
     def __len__(self):
         return len(self.dataset)
+   
     
     def next_target_range_step(self) -> float|None:
         if self.current_target_range_step_idx + 1 < len(self.target_range_steps):
@@ -324,12 +407,14 @@ class MARLEnv:
             self.xy_init_count -= self.xy_init_count.min()
         return np.vstack([x, y]).transpose()
 
-    def reset(self, file_id: int = -1):
+    def reset(self, file_id: int = -1) -> tuple[np.ndarray, np.ndarray]:
         self._switch_image(file_id_required=file_id)
         for i_agent in range(self.num_agents):
             self.history_obs_agents[i_agent].clear()
+            self.history_xy_agents[i_agent].clear()
             for _ in range(self.history_len):
                 self.history_obs_agents[i_agent].append(np.zeros((1, 3, self.rf_size, self.rf_size), dtype=np.float32))
+                self.history_xy_agents[i_agent].append(np.zeros((1,1,2)) + np.iinfo("int32").min)
         return self.get_observation()
     
     def get_visual_data(self, size: int = 64):
@@ -357,7 +442,7 @@ class MARLEnv:
             self.xy_agents = self._random_init_xy()
         else:
             self.xy_agents = label_data_init # avoid constant init location
-        # current_image_patched仅仅用来简化obs生成过程
+        # current_image_patched 仅仅用来简化obs生成过程
         self.current_image_patched = np.pad(self.current_image, ((pad_size, pad_size), (pad_size, pad_size), (0, 0)),
                                             constant_values=128, mode="constant")
         return
@@ -388,25 +473,31 @@ class MARLEnv:
         roi_data = (self.current_image_patched[y0 + offset:y1 + offset, x0 + offset:x1 + offset] - 128.0)/128.0
         return roi_data
 
-    def get_observation(self) -> np.ndarray:
+    def get_observation(self) -> tuple[np.ndarray, np.ndarray]:
         assert self.current_file_id >= 0 and self.current_file_id < len(self.dataset)
         for i_agent, (x, y) in enumerate(self.xy_agents):
             data = self._crop_roi((x, y))
             data = np.transpose(data, (2, 0, 1))[np.newaxis, :, :, :]
             self.history_obs_agents[i_agent].append(data)
+            xy = np.array([x,y]).reshape(1,1,2)
+            self.history_xy_agents[i_agent].append(xy)
         obs_all = []
+        xy_all = []
         for i_agent in range(self.num_agents):
             obs = np.concatenate([d for d in self.history_obs_agents[i_agent]], axis=1)
             obs_all.append(obs)
+            xy = np.concatenate([d for d in self.history_xy_agents[i_agent]], axis=1)
+            xy_all.append(xy)
         obs_data = np.concatenate(obs_all, axis=0)
-        return obs_data.copy() 
+        xy_data = np.concatenate(xy_all,axis=0)
+        return obs_data.copy(), xy_data
 
     def _take_actions(self, actions: list[int|None]) -> None:
         assert len(actions) == self.num_agents
         assert self.current_image is not None
         for i_agent, i_action in enumerate(actions):
             if i_action < 0:
-                continue # 输入 -1,表示不再移动agent
+                continue # 输入 -1,表示不再移动 agent
             # 必须和 select_action 中计算方法保持一致
             x = self.xy_agents[i_agent, 0] + self.actions[i_action][0]
             y = self.xy_agents[i_agent, 1] + self.actions[i_action][1]
@@ -414,7 +505,7 @@ class MARLEnv:
         self.xy_agents = np.clip(self.xy_agents, 0, self.face_size-1)
         return
 
-    def step(self, actions: list[int]) -> tuple[np.ndarray, float, list[bool], dict]:
+    def step(self, actions: list[int]) -> tuple[np.ndarray, np.ndarray, list[bool], dict]:
         """
         actions: [(dx0,dy0), ... (dxn, dyn)]
         return: (observation, reward, play_end, aux_info)
@@ -424,12 +515,12 @@ class MARLEnv:
         self._take_actions(actions)
         xy_agents_new = self.xy_agents
 
-        obs_new = self.get_observation()
+        obs_new, obs_xy_new = self.get_observation()
         assert self.xy_targets is not None
         dist_new = np.linalg.norm(self.xy_targets - xy_agents_new,  axis=-1, ord=2)
         dist_old = np.linalg.norm(self.xy_targets - xy_agents_old, axis=-1, ord=2)
         if self.use_abs_dist_as_reward:
-            reward = 1 - (dist_new/self.face_size) * self.reward_scale / 1.0 # 使用绝对量做reward, 需要仔细设计避免被agent发现 "捷径"
+            reward = 1 - (dist_new/self.face_size) * self.reward_scale / 1.0 # 使用绝对量做reward, 需要仔细设计避免被 agent 发现 "捷径"
         else:
             reward = (dist_old - dist_new) * self.reward_scale / self.face_size  #reward shaping    
             
@@ -439,7 +530,12 @@ class MARLEnv:
         info = {"success": np.all(success_mask),
                 "num_steps": self.num_steps,
                 "success_agents": np.mean(dist_new < target_range),
-                "success_agent_mask":success_mask} 
+                "success_agent_mask":success_mask,
+                "states_xy" : obs_xy_new.copy(),
+                "image_id": self.current_file_id,
+                "image": self.current_image,
+                "rf_size": self.rf_size
+                } 
         return obs_new, reward, success_mask, self.num_steps >= self.max_steps, info
     
 class PatchEncoder(nn.Module):
@@ -473,6 +569,11 @@ class CollabDQN(nn.Module):
             self.patch_encoder = patch_encoder
         self.fc1 = nn.Linear(self.patch_encoder.out_dim, 512)
         self.head = nn.Linear(512, n_actions)
+    def unshared_parameters(self) -> list[torch.nn.Parameter]:
+        params = list(self.fc1.parameters()) + list(self.head.parameters())
+        if not self.patch_encoder:
+            params += list(self.patch_encoder.parameters())
+        return params 
     def forward(self, x):
         x = self.patch_encoder(x)
         x = torch.relu(self.fc1(x))
@@ -515,6 +616,7 @@ class Agent:
     def __init__(self, agent_id, input_shape, n_actions, 
                  agent_action_selection_mode:str,
                  replay_buffer_size:int,
+                 rng: np.random.Generator,
                  lr=1e-3, # adam
                  device: str = "cuda:0",
                  epsilon=0.6, epsilon_decay=0.8, epsilon_min=0.05, 
@@ -532,13 +634,12 @@ class Agent:
         self.epsilon_decay = epsilon_decay # 0.8^(20) = 0.011
         self.epsilon_min = epsilon_min
         self.agent_action_selection_mode = agent_action_selection_mode
-
-        self.replay_buffer = ReplayBuffer(capacity=replay_buffer_size)  # eat up memory!!! but have to be larger than max_step
+        self.rng = rng
+        self.replay_buffer = ReplayBuffer(capacity=replay_buffer_size, rng=rng)  # eat up memory!!! but have to be larger than max_step
 
         self.policy_net = CollabDQN(input_shape, n_actions, patch_encoder=shared_patch_encoder)
         self.policy_net.to(self.device)
-        # fixme: 共享encoding情况下，同一份参数会会被多个optimizer共享
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
+        self.optimizer = optim.Adam(self.policy_net.unshared_parameters(), lr=lr)
         # 目标网络通常不共享，或者以较慢速度同步，这里保持独立以稳定训练
         self.target_net = CollabDQN(input_shape, n_actions)
         self.target_net.to(self.device)
@@ -550,7 +651,7 @@ class Agent:
 
 
     def select_action(self, state, current_xy: np.ndarray, actions:list[tuple[int,int]]):
-        if self.flag_train and random.random() < self.epsilon:
+        if self.flag_train and self.rng.uniform(0,1) < self.epsilon:
             x, y = current_xy
             visits = []
             xys = []
@@ -561,7 +662,7 @@ class Agent:
             # TODO: use exp-energy
             total = sum(visits)
             if total < 1.0:
-                return random.choice([k for k in range(self.n_actions)])
+                return self.rng.choice([k for k in range(self.n_actions)],size=1).item()
             if self.agent_action_selection_mode.lower() == "dfs":
                 p = [v / total for v in visits] # 深度优先
             elif self.agent_action_selection_mode.lower() == "bfs":
@@ -570,7 +671,7 @@ class Agent:
                 p = [v / t for v in p] 
             else: # 随机游走
                 p = [1/len(visits) for _ in range(len(visits))]
-            i_action = np.random.choice(np.arange(self.n_actions), size=1, p=p, replace=False).item()
+            i_action = self.rng.choice(np.arange(self.n_actions), size=1, p=p, replace=False).item()
             self.explorer.set_visit(xys[i_action])
             return i_action
         else:
@@ -583,6 +684,7 @@ class Agent:
                 x, y = current_xy
                 nx, ny = int(actions[i_action][0] + x), int(actions[i_action][1] + y)
                 self.explorer.set_visit((nx, ny))
+                
                 return i_action
 
     def update_target_network(self):
@@ -596,10 +698,11 @@ class MARLBase:
     def __init__(self, num_agents, input_shape, n_actions, 
                  agent_action_selection_mode:str,
                  replay_buffer_size:int,
+                 rng: np.random.Generator,
                  device: str = "cuda:0", 
                  use_weight_sharing=False, 
                  flag_train=True):
-
+        self.rng = rng
         self.episode_count = 0
         self.device = torch.device(device)
 
@@ -610,8 +713,11 @@ class MARLBase:
         # 如果使用权重共享，创建一个共享的策略网络
         if use_weight_sharing:
             self.shared_patch_encoder = PatchEncoder(input_shape)
+            self.optimizer = torch.optim.Adam(self.shared_patch_encoder.parameters(),
+                                              lr = 1e-3)
         else:
             self.shared_patch_encoder = None
+            self.optimizer = None
 
         # 2. 初始化智能体
         self.agents = []
@@ -622,6 +728,7 @@ class MARLBase:
                 n_actions=n_actions,
                 replay_buffer_size=replay_buffer_size,
                 device=device,
+                rng=rng,
                 shared_patch_encoder=self.shared_patch_encoder,
                 flag_train=flag_train,
                 agent_action_selection_mode=agent_action_selection_mode
@@ -661,20 +768,26 @@ class MARLBase:
         return
 
 class MARLTrain(MARLBase):
-    def __init__(self, num_agents, input_shape, n_actions, agent_action_selection_mode:str,
+    def __init__(self, num_agents, input_shape, n_actions, 
+                 agent_action_selection_mode:str,
                  replay_buffer_size:int,
                  gamma:float,
-                 device: str = "cuda:0", use_weight_sharing=False, 
+                 rng : np.random.Generator,
+                 device: str = "cuda:0", 
+                 use_weight_sharing=False, 
                  freezing_success_agent=False):
         super().__init__(num_agents=num_agents, 
                          input_shape=input_shape, 
                          n_actions=n_actions,
                          device=device,
+                         rng = rng,
                          replay_buffer_size=replay_buffer_size,
-                         use_weight_sharing=use_weight_sharing, flag_train=True,
+                         use_weight_sharing=use_weight_sharing, 
+                         flag_train=True,
                          agent_action_selection_mode=agent_action_selection_mode)
         self.freezing_success_agent = freezing_success_agent
         self.gamma = gamma
+        self.rng = rng
     def train_step(self, batch_size: int = 64, update_steps: int = 100)->dict:
         """
         执行一次梯度更新。
@@ -684,11 +797,14 @@ class MARLTrain(MARLBase):
         loss_all = []
         for _ in range(update_steps):
             loss_agents = []
+            optimizers_to_update = [] 
+            if self.optimizer is not None:
+                optimizers_to_update += [self.optimizer]
             for policy_net, target_net, optimizer, replay_buffer in nets_to_update:
                 # 从共享缓冲区采样
-                states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
+                states, actions, rewards, next_states, dones,_ = replay_buffer.sample(batch_size)
                 if states is None:
-                    loss_agents.append(0.0)
+                    loss_agents.append(torch.zeros((1,),device=self.device))
                     continue # replay buffer中样本太少，直接跳过训练
                     
 
@@ -707,13 +823,28 @@ class MARLTrain(MARLBase):
                     next_q = target_net(next_states_gpu).max(-1)[0].unsqueeze(1)
                     target_q = rewards_gpu + (self.gamma * next_q * (1 - dones_gpu))
                     
-                loss = nn.MSELoss()(current_q, target_q)
+                loss_agent = nn.MSELoss()(current_q, target_q)
                 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                loss_agents.append(loss.cpu().item())
-            loss_all.append(np.array(loss_agents).reshape(1, -1))
+                optimizers_to_update.append(optimizer)  
+                loss_agents.append(loss_agent[None])
+            
+            if optimizers_to_update != []:
+                for opt in optimizers_to_update:
+                    opt.zero_grad()
+                torch.mean(torch.concat(loss_agents)).backward() 
+                params_all = []
+                for agent in self.agents:
+                    params_all += list(agent.policy_net.unshared_parameters())
+                if self.shared_patch_encoder is not None:
+                    params_all += list(self.shared_patch_encoder.parameters())
+                # TODO: put max_norm into config file
+                torch.nn.utils.clip_grad_norm_(params_all, max_norm=10.0, norm_type=2.0 )
+                for opt in optimizers_to_update: 
+                    opt.step()
+                loss_agents = [l.cpu().item() for l in loss_agents]
+                loss_all.append(np.array(loss_agents).reshape(1, -1))
+            else:
+                loss_all.append(np.zeros(1,self.num_agents))
         loss_all = np.mean(np.concatenate(loss_all, axis=0), axis=0)
         return {"loss": loss_all}
 
@@ -722,7 +853,7 @@ class MARLTrain(MARLBase):
         运行一个完整的Episode，收集所有智能体的经验到共享缓冲区
         """
         # 重置环境，获取初始状态列表 [state_0, state_1, ..., state_k]
-        states = env.reset()
+        states,states_xy = env.reset()
         actions_all = []
         visual_data_all = [env.get_visual_data()]
         rewards_all = []
@@ -742,13 +873,10 @@ class MARLTrain(MARLBase):
                 
                 # 2. 执行动作，与环境交互
                 next_states, rewards, dones, truncated, info = env.step(actions)
- 
-                #if np.any(info['success_agent_mask']):
-                #    for i, mask in enumerate(info['success_agent_mask']):
-                #        if mask and (not success_agent_mask[i]):
-                #            logger.warning(f"agent {i} achieves target location. samples collected: {len(rewards_all)}")
-  
-                
+                rf_size = info['rf_size'] 
+                next_states_xy = info['states_xy']  
+                image_id = info['image_id']  
+                image = info['image']   
                    
                        
                 if False:
@@ -767,10 +895,10 @@ class MARLTrain(MARLBase):
                     for i, agent in enumerate(self.agents):
                         if success_agent_mask[i]:
                             continue # 已经达到目标位置的agent不再更新对应的replay buffer, 保持当前样本集
-                        agent.replay_buffer.push(states[i], actions[i], rewards[i].item(), next_states[i], dones[i])
+                        agent.replay_buffer.push(states[i], states_xy[i], actions[i], rewards[i].item(), next_states[i], next_states_xy[i], dones[i], image_id, image, rf_size)
                 else:
                     for i, agent in enumerate(self.agents):
-                        agent.replay_buffer.push(states[i], actions[i], rewards[i].item(), next_states[i], dones[i])
+                        agent.replay_buffer.push(states[i], states_xy[i], actions[i], rewards[i].item(), next_states[i], next_states_xy[i], dones[i], image_id, image, rf_size)
 
                 if self.freezing_success_agent: # 更新success_agent_mask
                     success_agent_mask = [success_agent_mask[i] or info['success_agent_mask'][i] for i in range(self.num_agents)]
@@ -778,11 +906,11 @@ class MARLTrain(MARLBase):
                         assert np.all(dones)
                  
                 states = next_states
-                
+                states_xy = next_states_xy
                 # 终止条件检查
                 if all(dones) or truncated:
                     success_agents += [info['success_agents']] # episode结束时 agent达到目标位置的比例
-                    states = env.reset() # reset for a new episode
+                    states,states_xy = env.reset() # reset for a new episode
                     success_agent_mask = [False for _ in range(self.num_agents)]
                     break
 
@@ -835,7 +963,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         cfg = tomllib.load(f)
 
     seed = cfg.get("seed",42)
-    set_seed(seed)
+    rng = set_seed(seed)
     face_size = cfg.get("face_size", 512)
     rf_size = cfg.get('rf_size', 64)
     num_episode = cfg.get("num_episode", 1000)
@@ -873,11 +1001,11 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     input_shape = (1, input_channels, rf_size, rf_size)
     n_actions = len(actions)
     logger.info(f"face size: {face_size}") 
-    env_tr = MARLEnv(dataset_root, split="train", face_size=face_size, rf_size=rf_size, history_len=history_len,
+    env_tr = MARLEnv(dataset_root, split="train", rng=rng, face_size=face_size, rf_size=rf_size, history_len=history_len,
                      actions=actions, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
                      max_steps=max_steps, random_init_xy=random_init_xy,use_abs_dist_as_reward=use_abs_dist_as_reward,
                      target_range_steps=target_range_steps)
-    env_te = MARLEnv(dataset_root, split="test", face_size=face_size, rf_size=rf_size, history_len=history_len,
+    env_te = MARLEnv(dataset_root, split="test", rng=rng, face_size=face_size, rf_size=rf_size, history_len=history_len,
                      actions=actions, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
                      max_steps=max_steps, random_init_xy=random_init_xy,use_abs_dist_as_reward=use_abs_dist_as_reward,
                      target_range_steps=(target_range_steps[-1],))
@@ -886,7 +1014,8 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         input_shape=input_shape,
         n_actions=n_actions,
         device=device,
-        replay_buffer_size=max_steps*3,
+        rng = rng,
+        replay_buffer_size=max_steps*100,
         gamma=0.999,
         agent_action_selection_mode=agent_action_selection_mode,
         use_weight_sharing=shared_patch_encoder,  # Collab-DQN 
@@ -897,6 +1026,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         input_shape=input_shape,
         n_actions=n_actions,
         device=device,
+        rng = rng,
         use_weight_sharing=shared_patch_encoder,  # Collab-DQN 
         agent_action_selection_mode=agent_action_selection_mode
     )
@@ -915,8 +1045,8 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
                                            batch_size=batch_size, update_steps=update_steps,
                                            target_update_freq=target_update_freq)
         
-        logger.info(f"success_agents: {_format_container(_calc_percentile(episode_info['success_agents']))}")
-        logger.info(f"epsilon_agents: {_format_container(_calc_percentile(episode_info['epsilon_agents']))}")
+        logger.info(f"{episode:0>5d} success_agents: {_format_container(_calc_percentile(episode_info['success_agents']))}")
+        logger.info(f"{episode:0>5d} epsilon_agents: {_format_container(_calc_percentile(episode_info['epsilon_agents']))}")
         for i_agent, agent in enumerate(trainer.agents):
             logger.info(
                 f"agent {i_agent} replay:"
@@ -932,7 +1062,6 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
             else:
                 logger.warning("stop update target range step")
                 
-        
         for i_agent in range(env_tr.num_agents):
             for name in ['loss', 'entropy', 'reward_mean', 'reward_std']:
                 summary_writer.add_scalar(f"{name}/agent{i_agent:0>3d}", episode_info[name][i_agent], episode)
@@ -964,17 +1093,19 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
 class MARLEval(MARLBase):
     def __init__(self, num_agents, input_shape, n_actions, 
                  agent_action_selection_mode:str,
+                 rng: np.random.Generator,
                  device: str = "cuda:0", use_weight_sharing=False):
         super().__init__(num_agents=num_agents, 
                          input_shape=input_shape, 
                          n_actions=n_actions,
                          device=device,
+                         rng = rng,
                          replay_buffer_size=1,
                          use_weight_sharing=use_weight_sharing, flag_train=False,
                          agent_action_selection_mode=agent_action_selection_mode)
     def stat_success(self, env) -> dict:
         success_stat = {"all":[], "agents":[]}
-        for i_episode in range(len(env)):
+        for i_episode in tqdm(range(len(env)),desc="eval"):
             info = self.run_episode(env)
             success_stat['all'].append(info['success'])
             success_stat['agents'].append(info['success_agents'])
@@ -982,7 +1113,7 @@ class MARLEval(MARLBase):
 
     def run_episode(self, env):
         # 重置环境，获取初始状态列表 [state_0, state_1, ..., state_k]
-        states = env.reset()
+        states,_ = env.reset()
         actions_all = []
         visual_data_all = [env.get_visual_data()]
         rewards_all = []
@@ -1000,13 +1131,6 @@ class MARLEval(MARLBase):
             
             # 2. 执行动作，与环境交互
             next_states, rewards, dones, truncated, info = env.step(actions)
-
-            if False:
-                for i_agent in range(next_states.shape[0]):
-                    obs = np.clip(np.transpose(next_states[i_agent],(1, 2, 0)) * 128 + 128, 0, 255).astype(np.uint8)
-                    frames = [obs[:, :, i:i+3] for i in range(0, obs.shape[-1], 3)]
-                    frames_image = np.vstack(frames)
-                    cv2.imwrite(f"./obs_agent_{i_agent:0>3d}.png", frames_image)
 
             visual_data_all += [env.get_visual_data()]
             rewards_all.append(np.array(rewards).astype(np.float32).reshape(1, -1))
@@ -1049,7 +1173,7 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     with open(config_file, 'rb') as f:
         cfg = tomllib.load(f)
     seed = cfg.get("seed",42)
-    set_seed(seed)
+    rng = set_seed(seed)
     face_size = cfg.get("face_size", 512)
     rf_size = cfg.get('rf_size', 64)
     history_len = cfg.get("history_len", 5)
@@ -1079,7 +1203,7 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     input_shape = (1, input_channels, rf_size, rf_size)
     n_actions = len(actions)
     logger.info(f"face size: {face_size}") 
-    env = MARLEnv(dataset_root, split="test", face_size=face_size,
+    env = MARLEnv(dataset_root, split="test", face_size=face_size, rng=rng,
                   rf_size=rf_size, history_len=history_len,
                   actions=actions, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
                   max_steps=max_steps, random_init_xy=random_init_xy, 
@@ -1090,6 +1214,7 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
         input_shape=input_shape,
         n_actions=n_actions,
         device=device,
+        rng = rng,
         use_weight_sharing=shared_patch_encoder
         )
     logger.info(f"dataset size {len(env)}")

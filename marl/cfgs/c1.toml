@@ -8,22 +8,22 @@
 
 face_size = 512
 rf_size = 64
-num_episode = 100
+num_episode = 5000 # 应该不低于 dataset_size_max
 history_len = 2 #5
-max_steps = 6000
+max_steps = 300
 
 batch_size = 64
 reward_scale = 10.0
 
 actions = [[5,0], [-5,0], [0,5], [0,-5], [0,0]]
 
-dataset_size_max = 2
+dataset_size_max = 300
 
 random_init_xy = false
 
 update_steps = 30
 
-shared_patch_encoder = false # 共享版本可能有个bug: 同一份参数被多个独立而optimizer分次更新
+shared_patch_encoder = true # 共享编码器
 
 target_update_freq = 5
 
@@ -35,4 +35,4 @@ use_abs_dist_as_reward = false
 
 [training]
 freezing_success_agent = true 
-target_range_steps = [30,10,5]
+target_range_steps = [100,50,30,10,5]
