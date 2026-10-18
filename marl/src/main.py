@@ -12,12 +12,19 @@
 - [x] 支持seed, 确保结果可复现
 - [ ] Double DQN
 - [ ] target network软跟新: Polyak
-- [ ] 验证history_len对训练的影响
+- [ ] 增加 td-err-mean, ted-err-std 监控target net 更新频率
+- [ ] 基于 td-err 设置 replay buffer 中样本权重
+- [ ] 验证 history_len 对训练的影响
+- [ ] 验证 epsilon_decay 对训练的影响
+- [ ] 把全图缩放后，融入 agent 的输入信号，增加全局信息
 - [x] 使用mean face优化初始位置
 - [x] 共享embeddding层,只用一个Optimizer做更新共享层(使用多个 agent 对应 loss 的均值做backward)
 - [x] replay buffer中不要直接存储obs, 而是obs的索引，避免重复的帧被多次存储
-- [ ] replay buffer中存储image path + 坐标，动态生成obs deperated
-- [ ] replay buffer中obs采用uint8存储. deperated
+- [x] 每步施加惩罚，避免太多零激励样本
+-----------------DEPERATED-----------------------------------------
+- [ ] replay buffer中存储image path + 坐标,动态生成obs 
+- [ ] replay buffer中obs采用uint8存储. 
+
 -------------------------------------------
 1. online network每次更新抽取~0.25的新增样本即可
 2. BFS/DFS/random对于selection action差异不大
@@ -60,7 +67,7 @@ def set_seed(seed:int) -> np.random.Generator:
     return np.random.default_rng(seed)
 
 
-def _format_container(obj, width=8, precision=4):
+def _format_container(obj, width=6, precision=3):
     if isinstance(obj, float):
         return f"{obj:{width}.{precision}f}"
     elif isinstance(obj, np.ndarray):
@@ -97,6 +104,10 @@ class ReplayBuffer:
         self.image_pool:dict[int, dict] = {}
         self.rng = rng if rng else np.random.default_rng(42)
 
+    def reset(self):
+        self.buffer.clear()
+        self.image_pool.clear()
+        
     def push(self, 
              state,state_xy, 
              action, reward, 
@@ -372,6 +383,7 @@ class MARLEnv:
 
         self.max_steps = max_steps 
         self.num_steps = 0
+        self.reward_on_timecost = -1.0 / max_steps
 
         self.reward_scale = reward_scale #all xy is in [0,1]
 
@@ -523,6 +535,9 @@ class MARLEnv:
             reward = 1 - (dist_new/self.face_size) * self.reward_scale / 1.0 # 使用绝对量做reward, 需要仔细设计避免被 agent 发现 "捷径"
         else:
             reward = (dist_old - dist_new) * self.reward_scale / self.face_size  #reward shaping    
+            
+        if hasattr(self, "reward_on_timecost"):
+            reward += self.reward_on_timecost
             
         target_range = self.target_range_steps[self.current_target_range_step_idx]
         success_mask = [dist_new[i] < target_range for i in range(self.num_agents)]
@@ -788,6 +803,10 @@ class MARLTrain(MARLBase):
         self.freezing_success_agent = freezing_success_agent
         self.gamma = gamma
         self.rng = rng
+    def reset_replay_buffer(self):
+        for agent in self.agents:
+            agent.replay_buffer.reset()
+            
     def train_step(self, batch_size: int = 64, update_steps: int = 100)->dict:
         """
         执行一次梯度更新。
@@ -1015,7 +1034,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         n_actions=n_actions,
         device=device,
         rng = rng,
-        replay_buffer_size=max_steps*100,
+        replay_buffer_size=max_steps*100, # make replay buffer larger enough
         gamma=0.999,
         agent_action_selection_mode=agent_action_selection_mode,
         use_weight_sharing=shared_patch_encoder,  # Collab-DQN 
@@ -1041,24 +1060,35 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     top_eval_metric = np.finfo("float").min
     for episode in range(num_episode):
         trainer.episode_count = episode
-        episode_info = trainer.run_episode(env_tr, max_steps_collected=max_steps, 
-                                           batch_size=batch_size, update_steps=update_steps,
+        episode_info = trainer.run_episode(env_tr,
+                                           max_steps_collected=max_steps, # should be much smaller than replay buffer capacity  
+                                           batch_size=batch_size, 
+                                           update_steps=update_steps,
                                            target_update_freq=target_update_freq)
         
-        logger.info(f"{episode:0>5d} success_agents: {_format_container(_calc_percentile(episode_info['success_agents']))}")
+        success_agents_percentile = _calc_percentile(episode_info['success_agents'])
+        logger.info(f"{episode:0>5d} success_agents: {_format_container(success_agents_percentile)}")
+        for k,v in success_agents_percentile.items():
+            summary_writer.add_scalar(f"success_agentsAll/{k}", v, episode)
         logger.info(f"{episode:0>5d} epsilon_agents: {_format_container(_calc_percentile(episode_info['epsilon_agents']))}")
         for i_agent, agent in enumerate(trainer.agents):
+            agent_stat = agent.replay_buffer.stat()
             logger.info(
                 f"agent {i_agent} replay:"
-                f"{_format_container(agent.replay_buffer.stat())}"
+                f"{_format_container(agent_stat)}"
             )
+            for k, v in agent_stat['reward'].items():
+                summary_writer.add_scalar(f"success/agent_{i_agent:0>3d}/{k}", v, episode)
+            
         if np.percentile(episode_info['success_agents'],80) >= 0.98:
             target_range_step_last =  env_tr.next_target_range_step()
             if target_range_step_last is not None:
+                trainer.reset_replay_buffer()  # clear buffer to remove sample from last curriculum 
+                logger.warning("reset replay buffer")       
                 p50 = np.percentile(episode_info['success_agents'],50)
                 p80 = np.percentile(episode_info['success_agents'],80)
                 p95 = np.percentile(episode_info['success_agents'],95)
-                logger.info(f"target range step {target_range_step_last} | success agents (P50,P80,P95)=({p50:5.2f},{p80:5.2f},{p95:5.2f})")
+                logger.warning(f"target range step {target_range_step_last} | success agents (P50,P80,P95)=({p50:5.2f},{p80:5.2f},{p95:5.2f})")
             else:
                 logger.warning("stop update target range step")
                 
@@ -1070,7 +1100,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
             cv2.imwrite(os.path.join(outdir, f"{episode:0>8d}.jpg"), episode_info['visual_data'])
             trainer.save(os.path.join(outdir, "last.pth"))
             evaluater.load(os.path.join(outdir, "last.pth"))
-            success_stat = evaluater.stat_success(env_te)
+            success_stat = evaluater.stat_success(env_te,sampling=10) # sampling=10 to make eval faster
             summary_writer.add_scalar("eval/success/all", success_stat['all'], episode)
             summary_writer.add_scalar("eval/success/agents", success_stat['agents'], episode)
             logger.info(
@@ -1103,9 +1133,9 @@ class MARLEval(MARLBase):
                          replay_buffer_size=1,
                          use_weight_sharing=use_weight_sharing, flag_train=False,
                          agent_action_selection_mode=agent_action_selection_mode)
-    def stat_success(self, env) -> dict:
+    def stat_success(self, env, sampling=1) -> dict:
         success_stat = {"all":[], "agents":[]}
-        for i_episode in tqdm(range(len(env)),desc="eval"):
+        for i_episode in tqdm(range(0,len(env),sampling),desc=f"eval with sampling={sampling}"):
             info = self.run_episode(env)
             success_stat['all'].append(info['success'])
             success_stat['agents'].append(info['success_agents'])
