@@ -7,12 +7,11 @@
 - [ ] 把参数分层
 - [x] 支持"课程", 先放宽"成功"的定义,当成功率足够高以后再逐渐提高"成功"质量
 - [ ] 退火 epsilon 替代动作选择
-- [ ] 按照更新次数对epsilon做退火,不要基于采样轮次做退火
 - [x] 分析 select_action 是否能覆盖解空间   
 - [x] 支持seed, 确保结果可复现
 - [ ] Double DQN
 - [ ] target network软跟新: Polyak
-- [ ] 增加 td-err-mean, ted-err-std 监控target net 更新频率
+- [x] 增加 td-err-mean, td-err-std 监控 target net 更新频率
 - [ ] 基于 td-err 设置 replay buffer 中样本权重
 - [ ] 验证 history_len 对训练的影响
 - [ ] 验证 epsilon_decay 对训练的影响
@@ -21,10 +20,11 @@
 - [x] 共享embeddding层,只用一个Optimizer做更新共享层(使用多个 agent 对应 loss 的均值做backward)
 - [x] replay buffer中不要直接存储obs, 而是obs的索引，避免重复的帧被多次存储
 - [x] 每步施加惩罚，避免太多零激励样本
+- [ ] 把连续 20 episode  success 统计值大于80% s作为课程切换的依据
 -----------------DEPERATED-----------------------------------------
 - [ ] replay buffer中存储image path + 坐标,动态生成obs 
 - [ ] replay buffer中obs采用uint8存储. 
-
+- [ ] 按照更新次数对epsilon做退火,不要基于采样轮次做退火
 -------------------------------------------
 1. online network每次更新抽取~0.25的新增样本即可
 2. BFS/DFS/random对于selection action差异不大
@@ -53,7 +53,6 @@ import tomllib
 import shutil
 import gc
 from typing import Iterable
-
 SAVE_REPLAY_BUFFER = False # 保存repaly buffer需要较多内存
 
 
@@ -714,6 +713,7 @@ class MARLBase:
                  agent_action_selection_mode:str,
                  replay_buffer_size:int,
                  rng: np.random.Generator,
+                 epsilon_decay: float = 0.99,
                  device: str = "cuda:0", 
                  use_weight_sharing=False, 
                  flag_train=True):
@@ -744,6 +744,7 @@ class MARLBase:
                 replay_buffer_size=replay_buffer_size,
                 device=device,
                 rng=rng,
+                epsilon_decay=epsilon_decay,
                 shared_patch_encoder=self.shared_patch_encoder,
                 flag_train=flag_train,
                 agent_action_selection_mode=agent_action_selection_mode
@@ -786,8 +787,9 @@ class MARLTrain(MARLBase):
     def __init__(self, num_agents, input_shape, n_actions, 
                  agent_action_selection_mode:str,
                  replay_buffer_size:int,
-                 gamma:float,
+                 epsilon_decay:float,
                  rng : np.random.Generator,
+                 gamma: float = 0.99,
                  device: str = "cuda:0", 
                  use_weight_sharing=False, 
                  freezing_success_agent=False):
@@ -796,22 +798,27 @@ class MARLTrain(MARLBase):
                          n_actions=n_actions,
                          device=device,
                          rng = rng,
+                         epsilon_decay=epsilon_decay,
                          replay_buffer_size=replay_buffer_size,
                          use_weight_sharing=use_weight_sharing, 
                          flag_train=True,
                          agent_action_selection_mode=agent_action_selection_mode)
         self.freezing_success_agent = freezing_success_agent
-        self.gamma = gamma
         self.rng = rng
+        self.agents_tderr_smoothed = [0.0 for _ in range(self.num_agents)]
+        self.tderr_ema_beta = 0.99
+        self.gamma = gamma
     def reset_replay_buffer(self):
         for agent in self.agents:
             agent.replay_buffer.reset()
+        self.agents_tderr_smoothed = [0.0 for _ in range(self.num_agents)]
             
     def train_step(self, batch_size: int = 64, update_steps: int = 100)->dict:
         """
         执行一次梯度更新。
         """
-
+        agents_tderr_mean = [[] for _ in range(self.num_agents)]
+        agents_tderr_std = [[] for _ in range(self.num_agents)]
         nets_to_update = [(agent.policy_net, agent.target_net, agent.optimizer, agent.replay_buffer) for agent in self.agents]
         loss_all = []
         for _ in range(update_steps):
@@ -819,7 +826,7 @@ class MARLTrain(MARLBase):
             optimizers_to_update = [] 
             if self.optimizer is not None:
                 optimizers_to_update += [self.optimizer]
-            for policy_net, target_net, optimizer, replay_buffer in nets_to_update:
+            for iagent, (policy_net, target_net, optimizer, replay_buffer) in enumerate(nets_to_update):
                 # 从共享缓冲区采样
                 states, actions, rewards, next_states, dones,_ = replay_buffer.sample(batch_size)
                 if states is None:
@@ -842,6 +849,13 @@ class MARLTrain(MARLBase):
                     next_q = target_net(next_states_gpu).max(-1)[0].unsqueeze(1)
                     target_q = rewards_gpu + (self.gamma * next_q * (1 - dones_gpu))
                     
+                tderr_agent = torch.abs(current_q.detach() - target_q).cpu()
+                
+                agents_tderr_mean[iagent].append(torch.mean(tderr_agent).item())
+                agents_tderr_std[iagent].append(torch.std(tderr_agent).item())
+                self.agents_tderr_smoothed[iagent] = self.tderr_ema_beta * self.agents_tderr_smoothed[iagent] + (1-self.tderr_ema_beta) * agents_tderr_mean[iagent][-1]
+                
+                
                 loss_agent = nn.MSELoss()(current_q, target_q)
                 
                 optimizers_to_update.append(optimizer)  
@@ -865,7 +879,10 @@ class MARLTrain(MARLBase):
             else:
                 loss_all.append(np.zeros(1,self.num_agents))
         loss_all = np.mean(np.concatenate(loss_all, axis=0), axis=0)
-        return {"loss": loss_all}
+        return {"loss": loss_all, 
+                "tderr_mean_agents":[np.mean(v_batch).item() if v_batch is not [] else 0 for v_batch in agents_tderr_mean], 
+                "tderr_std_agents": [np.mean(v_batch).item() if v_batch is not [] else 0 for v_batch in agents_tderr_std],
+                "tderr_mean_smoothed_agents": deepcopy(self.agents_tderr_smoothed)}
 
     def run_episode(self, env, max_steps_collected: int = 100, batch_size: int = 64, update_steps=100, target_update_freq: int = 10):
         """
@@ -1035,7 +1052,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         device=device,
         rng = rng,
         replay_buffer_size=max_steps*100, # make replay buffer larger enough
-        gamma=0.999,
+        epsilon_decay =0.95, 
         agent_action_selection_mode=agent_action_selection_mode,
         use_weight_sharing=shared_patch_encoder,  # Collab-DQN 
         freezing_success_agent=freezing_success_agent
@@ -1061,7 +1078,8 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     for episode in range(num_episode):
         trainer.episode_count = episode
         episode_info = trainer.run_episode(env_tr,
-                                           max_steps_collected=max_steps, # should be much smaller than replay buffer capacity  
+                                           #max_steps_collected: should be much smaller than replay buffer capacity. and resample 0.25 to training each episode
+                                           max_steps_collected=max([max_steps, 4*batch_size*update_steps//update_steps]), 
                                            batch_size=batch_size, 
                                            update_steps=update_steps,
                                            target_update_freq=target_update_freq)
@@ -1093,7 +1111,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
                 logger.warning("stop update target range step")
                 
         for i_agent in range(env_tr.num_agents):
-            for name in ['loss', 'entropy', 'reward_mean', 'reward_std']:
+            for name in ['loss', 'entropy', 'reward_mean', 'reward_std','tderr_mean_smoothed_agents','tderr_std_agents','tderr_mean_agents']:
                 summary_writer.add_scalar(f"{name}/agent{i_agent:0>3d}", episode_info[name][i_agent], episode)
             summary_writer.add_scalar(f"epsilon/agent_{i_agent:0>3d}", trainer.agents[i_agent].epsilon, episode)
         if episode % eval_freq == 0:

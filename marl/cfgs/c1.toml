@@ -10,12 +10,12 @@ face_size = 512
 rf_size = 64
 num_episode = 5000 # 应该不低于 dataset_size_max
 history_len = 2 #5
-max_steps = 300
+max_steps = 200
 
 batch_size = 64
 reward_scale = 10.0
 
-actions = [[5,0], [-5,0], [0,5], [0,-5], [0,0]]
+actions = [[2,0], [-2,0], [0,2], [0,-2], [0,0]]
 
 dataset_size_max = 300
 
@@ -25,7 +25,7 @@ update_steps = 30
 
 shared_patch_encoder = true # 共享编码器
 
-target_update_freq = 5
+target_update_freq = 4
 
 agent_action_selection_mode = "bfs" # dfs
 
