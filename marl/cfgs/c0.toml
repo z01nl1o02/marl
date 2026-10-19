@@ -28,11 +28,18 @@ update_steps = 100
 
 shared_patch_encoder = true
 
+# ---- new options (all optional, defaults shown) ----
+# per_agent_done = true    # agents freeze at target (stop moving/collecting; training continues)
+# save_replay = false      # pickle replay buffers into checkpoints (~50MB/agent extra)
+# lr = 1e-4                # per-agent head learning rate
+# encoder_lr = 1e-4        # shared encoder lr (defaults to lr)
+# loss_type = "mse"        # "mse" | "huber"
+
 target_update_freq = 10
 
 # heatmap prior init
 init_mode = "heatmap"
-heatmap_weights = "runs/heatmap_prior_v2/heatmap_net_best.pth"
+heatmap_weights = "runs/heatmap_20261019-193406/heatmap_net_best.pth"
 heatmap_init_jitter = 0.02        # initial jitter std (normalized units, ~10px @512)
 heatmap_init_jitter_min = 0.005   # anneal floor (~2.5px)
 heatmap_init_jitter_decay = 0.99  # per-episode decay (~230 episodes to floor)
