@@ -17,9 +17,8 @@ reward_scale = 10.0
 
 actions = [[2,0], [-2,0], [0,2], [0,-2], [0,0]]
 
-dataset_size_max = 300
+#dataset_size_max = 300
 
-random_init_xy = false
 
 update_steps = 30
 
@@ -29,10 +28,13 @@ target_update_freq = 4
 
 agent_action_selection_mode = "bfs" # dfs
 
+[agent]
+xy_init_method = "heatmap"  # random / fixed
 
 [env]
 use_abs_dist_as_reward = false
 
 [training]
+loss = "huber" # huber, mse
 freezing_success_agent = true 
 target_range_steps = [100,50,30,10,5]

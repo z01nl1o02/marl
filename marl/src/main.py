@@ -16,11 +16,15 @@
 - [ ] 验证 history_len 对训练的影响
 - [ ] 验证 epsilon_decay 对训练的影响
 - [ ] 把全图缩放后，融入 agent 的输入信号，增加全局信息
-- [x] 使用mean face优化初始位置
-- [x] 共享embeddding层,只用一个Optimizer做更新共享层(使用多个 agent 对应 loss 的均值做backward)
+- [x] 使用 mean face 优化初始位置
+- [x] 共享 embeddding 层,只用一个Optimizer做更新共享层(使用多个 agent 对应 loss 的均值做backward)
 - [x] replay buffer中不要直接存储obs, 而是obs的索引，避免重复的帧被多次存储
 - [x] 每步施加惩罚，避免太多零激励样本
 - [ ] 把连续 20 episode  success 统计值大于80% s作为课程切换的依据
+- [x] 支持 heatmap 做初始化
+- [ ] 每个 agent 单独统计成功率
+- [x] 支持 huber loss
+- [ ] 统计 value 的取值范围, 缩放到合适的范围
 -----------------DEPERATED-----------------------------------------
 - [ ] replay buffer中存储image path + 坐标,动态生成obs 
 - [ ] replay buffer中obs采用uint8存储. 
@@ -354,7 +358,7 @@ class MARLEnv:
                  rng: np.random.Generator,
                  reward_scale: float = 10.0,
                  history_len: int = 1, dataset_size_max: int | None = None, max_steps: int = 1000,
-                 random_init_xy: bool = True):
+                 agent_xy_init_method: str = "random"):
         self.actions = actions
         
         self.target_range_steps = target_range_steps
@@ -362,8 +366,8 @@ class MARLEnv:
 
         self.use_abs_dist_as_reward = use_abs_dist_as_reward
         self.flag_train = True if split.lower() == "train" else False
-        self.random_init_xy = random_init_xy
         
+       
         self.rng = rng
         self.history_len = history_len
         self.dataset = DatasetWFLW(dataset_root, split=split, dataset_size_max=dataset_size_max, face_size=face_size)
@@ -389,6 +393,15 @@ class MARLEnv:
         self.xy_init_count = np.zeros((face_size, face_size), dtype=np.float32)
         self.xy_init_count[face_size//2, face_size//2] = 1.0 #avoid zero-division
         self.face_size:int = face_size
+        
+        self.agent_xy_init_method = agent_xy_init_method
+        if agent_xy_init_method.lower() == "heatmap":
+            from marl.src.heatmap import load_heatmap_provider
+            weights_path = "runs/heatmap_prior/heatmap_net_best.pth"
+            self.agent_xy_init_func = load_heatmap_provider(weights_file=weights_path, num_points=self.num_agents)
+            logger.warning(f"load heatmap provider: {weights_path}")
+        else:
+            self.agent_xy_init_func = None 
 
         return
     
@@ -449,10 +462,23 @@ class MARLEnv:
         self.current_image = image_data
         self.xy_targets = label_data
         pad_size = self.rf_size
-        if self.random_init_xy:
+        if self.agent_xy_init_method.lower() == "random":
             self.xy_agents = self._random_init_xy()
+        elif self.agent_xy_init_method.lower() == "fixed":
+            self.xy_agents = label_data_init 
+        elif self.agent_xy_init_func is not None:
+            H,W, _ = image_data.shape
+            xy_init = np.asarray(self.agent_xy_init_func(image_data), dtype=np.float32)
+            assert xy_init.shape == (self.num_agents, 2)
+            xy_init = (xy_init*np.array([W,H]).reshape(1,2)).astype(np.int32)
+            # TODO: stat error and add init xy jitter
+            #self.last_init_err = float(np.mean(np.linalg.norm(xy_init - self.xy_targets, axis=-1)))
+            #if self.flag_train and self.init_jitter > 0:  # jitter curriculum: RL learns to correct residual error
+            #    xy_init = xy_init + np.random.normal(0.0, self.init_jitter, xy_init.shape).astype(np.float32)
+            #    xy_init = np.clip(xy_init, 0.0, 1.0)
+            self.xy_agents = xy_init                     
         else:
-            self.xy_agents = label_data_init # avoid constant init location
+            assert 0, f"invalid init-xy-method = {self.agent_xy_init_method}"  
         # current_image_patched 仅仅用来简化obs生成过程
         self.current_image_patched = np.pad(self.current_image, ((pad_size, pad_size), (pad_size, pad_size), (0, 0)),
                                             constant_values=128, mode="constant")
@@ -533,6 +559,10 @@ class MARLEnv:
         if self.use_abs_dist_as_reward:
             reward = 1 - (dist_new/self.face_size) * self.reward_scale / 1.0 # 使用绝对量做reward, 需要仔细设计避免被 agent 发现 "捷径"
         else:
+            """
+            reward 的取值范围 [-step * reward_scale/face_size, -step * reward_scale/face_size] 
+            step = 2, reward_scale = 10, face_size = 512 -> reward is in [-0.04, 0.04]
+            """
             reward = (dist_old - dist_new) * self.reward_scale / self.face_size  #reward shaping    
             
         if hasattr(self, "reward_on_timecost"):
@@ -792,7 +822,8 @@ class MARLTrain(MARLBase):
                  gamma: float = 0.99,
                  device: str = "cuda:0", 
                  use_weight_sharing=False, 
-                 freezing_success_agent=False):
+                 freezing_success_agent=False,
+                 training_loss = "mse"):
         super().__init__(num_agents=num_agents, 
                          input_shape=input_shape, 
                          n_actions=n_actions,
@@ -807,6 +838,10 @@ class MARLTrain(MARLBase):
         self.rng = rng
         self.agents_tderr_smoothed = [0.0 for _ in range(self.num_agents)]
         self.tderr_ema_beta = 0.99
+        if training_loss.lower() == "huber":
+            self.loss_func = torch.nn.SmoothL1Loss(beta=1.0)
+        elif training_loss.lower() == "mse":
+            self.loss_func = torch.nn.MSELoss()
         self.gamma = gamma
     def reset_replay_buffer(self):
         for agent in self.agents:
@@ -821,6 +856,7 @@ class MARLTrain(MARLBase):
         agents_tderr_std = [[] for _ in range(self.num_agents)]
         nets_to_update = [(agent.policy_net, agent.target_net, agent.optimizer, agent.replay_buffer) for agent in self.agents]
         loss_all = []
+        target_q_all = []
         for _ in range(update_steps):
             loss_agents = []
             optimizers_to_update = [] 
@@ -848,6 +884,7 @@ class MARLTrain(MARLBase):
                 with torch.no_grad():
                     next_q = target_net(next_states_gpu).max(-1)[0].unsqueeze(1)
                     target_q = rewards_gpu + (self.gamma * next_q * (1 - dones_gpu))
+                    target_q_all.extend([qq.item() for qq in target_q.flatten().cpu()])
                     
                 tderr_agent = torch.abs(current_q.detach() - target_q).cpu()
                 
@@ -856,7 +893,7 @@ class MARLTrain(MARLBase):
                 self.agents_tderr_smoothed[iagent] = self.tderr_ema_beta * self.agents_tderr_smoothed[iagent] + (1-self.tderr_ema_beta) * agents_tderr_mean[iagent][-1]
                 
                 
-                loss_agent = nn.MSELoss()(current_q, target_q)
+                loss_agent = self.loss_func(current_q, target_q)
                 
                 optimizers_to_update.append(optimizer)  
                 loss_agents.append(loss_agent[None])
@@ -882,7 +919,8 @@ class MARLTrain(MARLBase):
         return {"loss": loss_all, 
                 "tderr_mean_agents":[np.mean(v_batch).item() if v_batch is not [] else 0 for v_batch in agents_tderr_mean], 
                 "tderr_std_agents": [np.mean(v_batch).item() if v_batch is not [] else 0 for v_batch in agents_tderr_std],
-                "tderr_mean_smoothed_agents": deepcopy(self.agents_tderr_smoothed)}
+                "tderr_mean_smoothed_agents": deepcopy(self.agents_tderr_smoothed),
+                "target_q": target_q_all}
 
     def run_episode(self, env, max_steps_collected: int = 100, batch_size: int = 64, update_steps=100, target_update_freq: int = 10):
         """
@@ -914,14 +952,6 @@ class MARLTrain(MARLBase):
                 image_id = info['image_id']  
                 image = info['image']   
                    
-                       
-                if False:
-                    for i_agent in range(next_states.shape[0]):
-                        obs = np.clip(np.transpose(next_states[i_agent],(1, 2, 0)) * 128 + 128, 0, 255).astype(np.uint8)
-                        frames = [obs[:, :, i:i+3] for i in range(0, obs.shape[-1], 3)]
-                        frames_image = np.vstack(frames)
-                        cv2.imwrite(f"./obs_agent_{i_agent:0>3d}.png", frames_image)
-
 
                 visual_data_all += [env.get_visual_data()]
                 rewards_all.append(np.array(rewards).astype(np.float32).reshape(1, -1))
@@ -936,7 +966,7 @@ class MARLTrain(MARLBase):
                     for i, agent in enumerate(self.agents):
                         agent.replay_buffer.push(states[i], states_xy[i], actions[i], rewards[i].item(), next_states[i], next_states_xy[i], dones[i], image_id, image, rf_size)
 
-                if self.freezing_success_agent: # 更新success_agent_mask
+                if self.freezing_success_agent: # 更新 success_agent_mask
                     success_agent_mask = [success_agent_mask[i] or info['success_agent_mask'][i] for i in range(self.num_agents)]
                     if np.all(success_agent_mask):
                         assert np.all(dones)
@@ -965,7 +995,7 @@ class MARLTrain(MARLBase):
         for agent in self.agents:
             if agent.epsilon > agent.epsilon_min:
                 agent.epsilon *= agent.epsilon_decay
-            else:
+            if agent.epsilon < agent.epsilon_min:
                 agent.epsilon = agent.epsilon_min
                 
         # 6. 定期更新目标网络
@@ -994,7 +1024,6 @@ class MARLTrain(MARLBase):
         return train_info
     
 def train(config_file: str, dataset_root: str, desc: str = "marl", device: str = "cuda:0", weights_file: str | None = None, eval_freq: int = 10):
-
     with open(config_file, 'rb') as f:
         cfg = tomllib.load(f)
 
@@ -1009,7 +1038,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     reward_scale = cfg.get("reward_scale", 10.0)
     batch_size = cfg.get("batch_size", 64)
     dataset_size_max = cfg.get("dataset_size_max", None)
-    random_init_xy = cfg.get("random_init_xy", True)
+    agent_xy_init_method = cfg.get("agent",{}).get("xy_init_method","random")
     update_steps = cfg.get("update_steps", 100)
     shared_patch_encoder = cfg.get("shared_patch_encoder", True)
     target_update_freq = cfg.get("target_update_freq", 10)
@@ -1018,6 +1047,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     # freezing_success_agent: 已经达到目标的agent不再更新replay buffer, 不再移动, 但依然参与训练(避免震荡)
     freezing_success_agent = cfg.get("training",{}).get("freezing_success_agent",False)
     target_range_steps = cfg.get("training",{}).get("target_range_steps",(1,))
+    training_loss = cfg.get("training",{}).get("loss", "mse")
     
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     exp_name = f"{os.path.splitext(os.path.basename(config_file))[0]}_{desc}"
@@ -1039,11 +1069,11 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     logger.info(f"face size: {face_size}") 
     env_tr = MARLEnv(dataset_root, split="train", rng=rng, face_size=face_size, rf_size=rf_size, history_len=history_len,
                      actions=actions, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
-                     max_steps=max_steps, random_init_xy=random_init_xy,use_abs_dist_as_reward=use_abs_dist_as_reward,
+                     max_steps=max_steps, agent_xy_init_method=agent_xy_init_method,use_abs_dist_as_reward=use_abs_dist_as_reward,
                      target_range_steps=target_range_steps)
     env_te = MARLEnv(dataset_root, split="test", rng=rng, face_size=face_size, rf_size=rf_size, history_len=history_len,
                      actions=actions, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
-                     max_steps=max_steps, random_init_xy=random_init_xy,use_abs_dist_as_reward=use_abs_dist_as_reward,
+                     max_steps=max_steps, agent_xy_init_method=agent_xy_init_method,use_abs_dist_as_reward=use_abs_dist_as_reward,
                      target_range_steps=(target_range_steps[-1],))
     trainer = MARLTrain(
         num_agents=env_tr.num_agents,
@@ -1051,6 +1081,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         n_actions=n_actions,
         device=device,
         rng = rng,
+        training_loss=training_loss,
         replay_buffer_size=max_steps*100, # make replay buffer larger enough
         epsilon_decay =0.95, 
         agent_action_selection_mode=agent_action_selection_mode,
@@ -1086,9 +1117,11 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         
         success_agents_percentile = _calc_percentile(episode_info['success_agents'])
         logger.info(f"{episode:0>5d} success_agents: {_format_container(success_agents_percentile)}")
+        
         for k,v in success_agents_percentile.items():
             summary_writer.add_scalar(f"success_agentsAll/{k}", v, episode)
         logger.info(f"{episode:0>5d} epsilon_agents: {_format_container(_calc_percentile(episode_info['epsilon_agents']))}")
+        
         for i_agent, agent in enumerate(trainer.agents):
             agent_stat = agent.replay_buffer.stat()
             logger.info(
@@ -1097,7 +1130,12 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
             )
             for k, v in agent_stat['reward'].items():
                 summary_writer.add_scalar(f"success/agent_{i_agent:0>3d}/{k}", v, episode)
-            
+        
+        target_q_stats = _calc_percentile(episode_info['target_q'])
+        logger.info(f"{episode:0>5d} target_q: {_format_container(target_q_stats)}") 
+        
+        
+          
         if np.percentile(episode_info['success_agents'],80) >= 0.98:
             target_range_step_last =  env_tr.next_target_range_step()
             if target_range_step_last is not None:
@@ -1229,7 +1267,7 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     actions = cfg.get("actions", [[1, 0], [-1, 0], [0, 1], [0, -1]])
     reward_scale = cfg.get("reward_scale", 10.0)
     dataset_size_max = cfg.get("dataset_size_max", None)
-    random_init_xy = cfg.get("random_init_xy", True)
+    agent_init_xy = cfg.get("agent",{}).get("init_xy_mode","random")
     shared_patch_encoder = cfg.get("shared_patch_encoder", True)
     use_abs_dist_as_reward = cfg.get("env",{}).get("use_abs_dist_as_reward",True) 
     target_range_steps = cfg.get("training",{}).get("target_range_steps",(1,))

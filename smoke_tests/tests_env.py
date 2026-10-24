@@ -16,6 +16,27 @@ def test_targets():
     vis = env.get_visual_data(size=640)
     cv2.imshow("test_targets",vis)
     cv2.waitKey(5000) 
+    
+    
+def test_reward_range():
+    from marl.src.main import MARLEnv, _calc_percentile, _format_container
+    face_size = 512
+    actions = [(-2,0), (2,0), (0,2),(0,-2)]
+    rng = np.random.default_rng(42)
+    env = MARLEnv(dataset_root="D:\\dataset\\WFLW",split="train",rf_size=64, face_size=face_size,actions=actions,
+                  target_range_steps=(10,5), use_abs_dist_as_reward=False, history_len=5, 
+                  dataset_size_max=64,rng=rng)
+    env.reset()
+    
+    rewards_all = []
+    for iaction in range(len(actions)):
+        rewards = env.step([iaction] * env.num_agents)[1]
+        assert rewards.shape == (env.num_agents,)
+        assert len(rewards.flatten().tolist()) == env.num_agents
+        rewards_all.extend(rewards.flatten().tolist())
+    reward_stats = _calc_percentile(rewards_all)
+    print(f"reward distribution: {_format_container(reward_stats)}") 
+    
 
 def test_exploit_explore():
     from marl.src.main import Agent
@@ -74,5 +95,6 @@ def test_exploit_explore():
                 )
 if __name__ == "__main__":
     #test_exploit_explore() 
-    test_targets()
+    #test_targets()
+    test_reward_range()
     
