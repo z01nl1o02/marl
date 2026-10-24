@@ -9,7 +9,8 @@
 - [ ] 退火 epsilon 替代动作选择
 - [x] 分析 select_action 是否能覆盖解空间   
 - [x] 支持seed, 确保结果可复现
-- [ ] Double DQN
+- [x] Double DQN
+- [x] 统计 target_net 预测的取值范围,观察double DQN的效果
 - [ ] target network软跟新: Polyak
 - [x] 增加 td-err-mean, td-err-std 监控 target net 更新频率
 - [ ] 基于 td-err 设置 replay buffer 中样本权重
@@ -21,10 +22,13 @@
 - [x] replay buffer中不要直接存储obs, 而是obs的索引，避免重复的帧被多次存储
 - [x] 每步施加惩罚，避免太多零激励样本
 - [ ] 把连续 20 episode  success 统计值大于80% s作为课程切换的依据
+- [x] 对DQN参数初始化
+- [ ] 基于 net 输出 prob 统计 熵
 - [x] 支持 heatmap 做初始化
-- [ ] 每个 agent 单独统计成功率
+- [x] 支持 heatmap 初始化的扰动
+- [x] 每个 agent 单独统计成功率
 - [x] 支持 huber loss
-- [ ] 统计 value 的取值范围, 缩放到合适的范围
+- [x] 统计 target_q 的取值范围, 缩放到合适的范围
 -----------------DEPERATED-----------------------------------------
 - [ ] replay buffer中存储image path + 坐标,动态生成obs 
 - [ ] replay buffer中obs采用uint8存储. 
@@ -81,7 +85,7 @@ def _format_container(obj, width=6, precision=3):
     elif isinstance(obj, int):
         return f"{obj:{width}d}"
     elif isinstance(obj, dict):
-        items = ", ".join(f"{_format_container(k, width,precision)}: {_format_container(v, width,precision)}" for k, v in obj.items())
+        items = ", ".join(f"{_format_container(k, width,precision)}:{_format_container(v, width,precision)}" for k, v in obj.items())
         return f"{{{items}}}"
     elif isinstance(obj, (list, tuple)):
         items = ", ".join(_format_container(item, width,precision) for item in obj)
@@ -400,6 +404,8 @@ class MARLEnv:
             weights_path = "runs/heatmap_prior/heatmap_net_best.pth"
             self.agent_xy_init_func = load_heatmap_provider(weights_file=weights_path, num_points=self.num_agents)
             logger.warning(f"load heatmap provider: {weights_path}")
+            self.init_jitter = 0.2
+            self.decay_jitter = 0.9
         else:
             self.agent_xy_init_func = None 
 
@@ -470,12 +476,12 @@ class MARLEnv:
             H,W, _ = image_data.shape
             xy_init = np.asarray(self.agent_xy_init_func(image_data), dtype=np.float32)
             assert xy_init.shape == (self.num_agents, 2)
-            xy_init = (xy_init*np.array([W,H]).reshape(1,2)).astype(np.int32)
             # TODO: stat error and add init xy jitter
             #self.last_init_err = float(np.mean(np.linalg.norm(xy_init - self.xy_targets, axis=-1)))
-            #if self.flag_train and self.init_jitter > 0:  # jitter curriculum: RL learns to correct residual error
-            #    xy_init = xy_init + np.random.normal(0.0, self.init_jitter, xy_init.shape).astype(np.float32)
-            #    xy_init = np.clip(xy_init, 0.0, 1.0)
+            if self.flag_train and self.init_jitter > 0:  # jitter curriculum: RL learns to correct residual error
+                xy_init = xy_init + self.rng.normal(0.0, self.init_jitter, xy_init.shape).astype(np.float32)
+                xy_init = np.clip(xy_init, 0.0, 1.0)
+            xy_init = (xy_init*np.array([W,H]).reshape(1,2)).astype(np.int32)
             self.xy_agents = xy_init                     
         else:
             assert 0, f"invalid init-xy-method = {self.agent_xy_init_method}"  
@@ -590,6 +596,10 @@ class PatchEncoder(nn.Module):
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
 
+        for conv in [self.conv1, self.conv2, self.conv3]:
+            torch.nn.init.xavier_normal_(conv.weight)
+            torch.nn.init.zeros_(conv.bias)
+         
         with torch.no_grad():
             dummy_input = torch.zeros(shape_input)
             conv_final = self.conv3(self.conv2(self.conv1(dummy_input)))
@@ -612,7 +622,11 @@ class CollabDQN(nn.Module):
             self.shared_patch_encoder = True
             self.patch_encoder = patch_encoder
         self.fc1 = nn.Linear(self.patch_encoder.out_dim, 512)
+        torch.nn.init.normal_(self.fc1.weight, 0, 0.1)
+        torch.nn.init.zeros_(self.fc1.bias)
         self.head = nn.Linear(512, n_actions)
+        torch.nn.init.normal_(self.head.weight, 0, 0.1)
+        torch.nn.init.zeros_(self.head.bias)
     def unshared_parameters(self) -> list[torch.nn.Parameter]:
         params = list(self.fc1.parameters()) + list(self.head.parameters())
         if not self.patch_encoder:
@@ -823,7 +837,8 @@ class MARLTrain(MARLBase):
                  device: str = "cuda:0", 
                  use_weight_sharing=False, 
                  freezing_success_agent=False,
-                 training_loss = "mse"):
+                 training_loss = "mse",
+                 use_double_dqn = True):
         super().__init__(num_agents=num_agents, 
                          input_shape=input_shape, 
                          n_actions=n_actions,
@@ -843,6 +858,7 @@ class MARLTrain(MARLBase):
         elif training_loss.lower() == "mse":
             self.loss_func = torch.nn.MSELoss()
         self.gamma = gamma
+        self.use_double_dqn = use_double_dqn
     def reset_replay_buffer(self):
         for agent in self.agents:
             agent.replay_buffer.reset()
@@ -857,6 +873,7 @@ class MARLTrain(MARLBase):
         nets_to_update = [(agent.policy_net, agent.target_net, agent.optimizer, agent.replay_buffer) for agent in self.agents]
         loss_all = []
         target_q_all = []
+        target_net_out_all = []
         for _ in range(update_steps):
             loss_agents = []
             optimizers_to_update = [] 
@@ -882,9 +899,14 @@ class MARLTrain(MARLBase):
                 current_q = current_action_value.gather(1, actions_gpu)
                 # 计算目标Q值
                 with torch.no_grad():
-                    next_q = target_net(next_states_gpu).max(-1)[0].unsqueeze(1)
+                    if self.use_double_dqn:
+                        next_a = policy_net(next_states_gpu).max(-1)[1].unsqueeze(-1)
+                        next_q = target_net(next_states_gpu).gather(1, next_a)
+                    else:
+                        next_q = target_net(next_states_gpu).max(-1)[0].unsqueeze(1)
                     target_q = rewards_gpu + (self.gamma * next_q * (1 - dones_gpu))
                     target_q_all.extend([qq.item() for qq in target_q.flatten().cpu()])
+                    target_net_out_all.extend([qq.item() for qq in next_q.flatten().cpu()])
                     
                 tderr_agent = torch.abs(current_q.detach() - target_q).cpu()
                 
@@ -920,7 +942,9 @@ class MARLTrain(MARLBase):
                 "tderr_mean_agents":[np.mean(v_batch).item() if v_batch is not [] else 0 for v_batch in agents_tderr_mean], 
                 "tderr_std_agents": [np.mean(v_batch).item() if v_batch is not [] else 0 for v_batch in agents_tderr_std],
                 "tderr_mean_smoothed_agents": deepcopy(self.agents_tderr_smoothed),
-                "target_q": target_q_all}
+                "target_q": target_q_all,
+                "target_net_out": target_net_out_all
+                }
 
     def run_episode(self, env, max_steps_collected: int = 100, batch_size: int = 64, update_steps=100, target_update_freq: int = 10):
         """
@@ -1039,6 +1063,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     batch_size = cfg.get("batch_size", 64)
     dataset_size_max = cfg.get("dataset_size_max", None)
     agent_xy_init_method = cfg.get("agent",{}).get("xy_init_method","random")
+    agent_use_double_dqn = cfg.get("agent",{}).get("use_double_dqn",False)
     update_steps = cfg.get("update_steps", 100)
     shared_patch_encoder = cfg.get("shared_patch_encoder", True)
     target_update_freq = cfg.get("target_update_freq", 10)
@@ -1062,6 +1087,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     logger.info(f"actions: {actions}")
     logger.info(f"agent action selection model: {agent_action_selection_mode}")
     logger.info(f"use_abs_dist_as_reward: {use_abs_dist_as_reward}")
+    logger.info(f"use_double_dqn: {agent_use_double_dqn}")
 
     input_channels = 3 * history_len
     input_shape = (1, input_channels, rf_size, rf_size)
@@ -1081,6 +1107,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         n_actions=n_actions,
         device=device,
         rng = rng,
+        use_double_dqn=agent_use_double_dqn,
         training_loss=training_loss,
         replay_buffer_size=max_steps*100, # make replay buffer larger enough
         epsilon_decay =0.95, 
@@ -1119,7 +1146,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         logger.info(f"{episode:0>5d} success_agents: {_format_container(success_agents_percentile)}")
         
         for k,v in success_agents_percentile.items():
-            summary_writer.add_scalar(f"success_agentsAll/{k}", v, episode)
+            summary_writer.add_scalar(f"train/success_agentsAll/{k}", v, episode)
         logger.info(f"{episode:0>5d} epsilon_agents: {_format_container(_calc_percentile(episode_info['epsilon_agents']))}")
         
         for i_agent, agent in enumerate(trainer.agents):
@@ -1129,12 +1156,13 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
                 f"{_format_container(agent_stat)}"
             )
             for k, v in agent_stat['reward'].items():
-                summary_writer.add_scalar(f"success/agent_{i_agent:0>3d}/{k}", v, episode)
+                summary_writer.add_scalar(f"train/success/agent_{i_agent:0>3d}/{k}", v, episode)
         
         target_q_stats = _calc_percentile(episode_info['target_q'])
         logger.info(f"{episode:0>5d} target_q: {_format_container(target_q_stats)}") 
         
-        
+        target_net_out_stats = _calc_percentile(episode_info['target_net_out'])
+        logger.info(f"{episode:0>5d} target_net_out: {_format_container(target_net_out_stats)}") 
           
         if np.percentile(episode_info['success_agents'],80) >= 0.98:
             target_range_step_last =  env_tr.next_target_range_step()
@@ -1150,26 +1178,39 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
                 
         for i_agent in range(env_tr.num_agents):
             for name in ['loss', 'entropy', 'reward_mean', 'reward_std','tderr_mean_smoothed_agents','tderr_std_agents','tderr_mean_agents']:
-                summary_writer.add_scalar(f"{name}/agent{i_agent:0>3d}", episode_info[name][i_agent], episode)
-            summary_writer.add_scalar(f"epsilon/agent_{i_agent:0>3d}", trainer.agents[i_agent].epsilon, episode)
+                summary_writer.add_scalar(f"train/{name}/agent{i_agent:0>3d}", episode_info[name][i_agent], episode)
+            summary_writer.add_scalar(f"train/epsilon/agent_{i_agent:0>3d}", trainer.agents[i_agent].epsilon, episode)
+       
+        # TODO: move this into env class
+        env_tr.init_jitter = env_tr.init_jitter * env_tr.decay_jitter 
+        if env_tr.init_jitter < 0.01:
+            env_tr.init_jitter = 0.01
+        logger.info(
+            f"episode {episode:0>4d}|"
+            f"init jitter: {env_tr.init_jitter:3.2f}|"
+            f"loss: {_format_container(episode_info['loss'])}|"
+            f"ent: {_format_container(episode_info['entropy'])}")
+
+        
         if episode % eval_freq == 0:
             cv2.imwrite(os.path.join(outdir, f"{episode:0>8d}.jpg"), episode_info['visual_data'])
             trainer.save(os.path.join(outdir, "last.pth"))
             evaluater.load(os.path.join(outdir, "last.pth"))
-            success_stat = evaluater.stat_success(env_te,sampling=10) # sampling=10 to make eval faster
+            success_stat = evaluater.stat_success(env_te,sampling=1) # sampling > 1 to make eval faster
             summary_writer.add_scalar("eval/success/all", success_stat['all'], episode)
             summary_writer.add_scalar("eval/success/agents", success_stat['agents'], episode)
             logger.info(
-                f"Episode {episode}|"
-                f"loss: {_format_container(episode_info['loss'])}|"
-                f"ent: {_format_container(episode_info['entropy'])}|"
+                f"episode {episode:0>4d}|"
                 f"eval sucess: {_format_container(success_stat['agents'])}"
                 )
+            for i in range(len(success_stat['agent_mask'])):
+                v = success_stat['agent_mask'][i]
+                logger.info(f"agent_{i:0>2d} succcess {v:3.2f}")
             if success_stat['agents'] > top_eval_metric:
                 top_eval_metric = success_stat['agents']
                 logger.info(
                     f"NEW BEST MODEL! Episode {episode}|"
-                    f"eval success: {success_stat['agents']}")
+                    f"eval success: {success_stat['agents']:4.3f}")
                 evaluater.save(os.path.join(outdir, "best.pth"))
     logger.info(f"training stop with best metric {top_eval_metric}")
     trainer.save(os.path.join(outdir, "final.pth"))
@@ -1190,12 +1231,15 @@ class MARLEval(MARLBase):
                          use_weight_sharing=use_weight_sharing, flag_train=False,
                          agent_action_selection_mode=agent_action_selection_mode)
     def stat_success(self, env, sampling=1) -> dict:
-        success_stat = {"all":[], "agents":[]}
+        success_stat = {"all":[], "agents":[], "agent_mask":[]}
         for i_episode in tqdm(range(0,len(env),sampling),desc=f"eval with sampling={sampling}"):
             info = self.run_episode(env)
             success_stat['all'].append(info['success'])
             success_stat['agents'].append(info['success_agents'])
-        return {"all": np.mean(success_stat['all']), "agents": np.mean(success_stat['agents'])}
+            success_stat['agent_mask'].append(np.array(info['success_agent_mask']).reshape(1,-1)) 
+        return {"all": np.mean(success_stat['all']), 
+                "agents": np.mean(success_stat['agents']), 
+                "agent_mask":np.mean(success_stat['agent_mask'],axis=0).flatten().tolist()}
 
     def run_episode(self, env):
         # 重置环境，获取初始状态列表 [state_0, state_1, ..., state_k]
@@ -1205,7 +1249,6 @@ class MARLEval(MARLBase):
         rewards_all = []
         dxdy_all = np.zeros((self.num_agents, 2), dtype=np.float32)
         success: bool = False
-        success_agents: float = 0.0
         while True:
             actions = []
             # 1. 并行选择动作
@@ -1229,6 +1272,7 @@ class MARLEval(MARLBase):
 
         success = info.get("success", False)
         success_agents = info.get("success_agents",0.0)
+        success_agent_mask = info.get("success_agent_mask",[False] * self.num_agents)
 
         actions_all = np.concatenate(actions_all, axis=0)
         rewards_all = np.concatenate(rewards_all, axis=0)
@@ -1248,7 +1292,8 @@ class MARLEval(MARLBase):
             "reward_std": np.std(rewards_all, axis=0),
             "dxdy": dxdy_all,
             "success": success,
-            "success_agents": success_agents
+            "success_agents": success_agents,
+            "success_agent_mask": success_agent_mask
             } 
         return eval_info
 

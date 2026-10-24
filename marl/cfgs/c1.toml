@@ -13,7 +13,7 @@ history_len = 2 #5
 max_steps = 200
 
 batch_size = 64
-reward_scale = 10.0
+reward_scale = 100.0
 
 actions = [[2,0], [-2,0], [0,2], [0,-2], [0,0]]
 
@@ -30,6 +30,7 @@ agent_action_selection_mode = "bfs" # dfs
 
 [agent]
 xy_init_method = "heatmap"  # random / fixed
+use_double_dqn = true
 
 [env]
 use_abs_dist_as_reward = false
@@ -37,4 +38,4 @@ use_abs_dist_as_reward = false
 [training]
 loss = "huber" # huber, mse
 freezing_success_agent = true 
-target_range_steps = [100,50,30,10,5]
+target_range_steps = [30,10,5]
