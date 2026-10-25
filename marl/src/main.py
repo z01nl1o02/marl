@@ -23,7 +23,7 @@
 - [x] 每步施加惩罚，避免太多零激励样本
 - [ ] 把连续 20 episode  success 统计值大于80% s作为课程切换的依据
 - [x] 对DQN参数初始化
-- [ ] 基于 net 输出 prob 统计 熵
+- [x] 基于 net 输出 action prob 统计 entropy
 - [x] 支持 heatmap 做初始化
 - [x] 支持 heatmap 初始化的扰动
 - [x] 每个 agent 单独统计成功率
@@ -60,6 +60,7 @@ from datetime import datetime
 import tomllib
 import shutil
 import gc
+from moviepy import ImageSequenceClip
 from typing import Iterable
 SAVE_REPLAY_BUFFER = False # 保存repaly buffer需要较多内存
 
@@ -720,7 +721,7 @@ class Agent:
             # TODO: use exp-energy
             total = sum(visits)
             if total < 1.0:
-                return self.rng.choice([k for k in range(self.n_actions)],size=1).item()
+                return self.rng.choice([k for k in range(self.n_actions)],size=1).item(), {}
             if self.agent_action_selection_mode.lower() == "dfs":
                 p = [v / total for v in visits] # 深度优先
             elif self.agent_action_selection_mode.lower() == "bfs":
@@ -731,7 +732,7 @@ class Agent:
                 p = [1/len(visits) for _ in range(len(visits))]
             i_action = self.rng.choice(np.arange(self.n_actions), size=1, p=p, replace=False).item()
             self.explorer.set_visit(xys[i_action])
-            return i_action
+            return i_action, {}
         else:
             with torch.no_grad():
                 # state shape: (4, H, W) -> add batch dim: (1, 4, H, W)
@@ -743,7 +744,8 @@ class Agent:
                 nx, ny = int(actions[i_action][0] + x), int(actions[i_action][1] + y)
                 self.explorer.set_visit((nx, ny))
                 
-                return i_action
+                p = torch.softmax(q_values,dim=-1)
+                return i_action, {"entropy": (-p*torch.log(p)).mean().item()}
 
     def update_target_network(self):
         self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -957,16 +959,19 @@ class MARLTrain(MARLBase):
         rewards_all = []
         success_agent_mask = [False for _ in range(self.num_agents)]
         success_agents = []
+        entropy_agents = [[] for _ in range(self.num_agents)]
         while len(rewards_all) <= max_steps_collected:
             while True:
                 actions = []
                 # 1. 并行选择动作
                 for i, agent in enumerate(self.agents):
                     if success_agent_mask[i]:
-                        action = -1 # disable move
+                        action, info = -1, {} # disable move
                     else:
-                        action = agent.select_action(states[i], env.xy_agents[i], env.actions)
+                        action, info = agent.select_action(states[i], env.xy_agents[i], env.actions)
                     actions.append(action)
+                    if 'entropy' in info:
+                        entropy_agents[i].append(info['entropy'])
                 actions_all.append(np.array(actions).astype(np.int32).reshape(1, -1))
                 
                 # 2. 执行动作，与环境交互
@@ -1006,12 +1011,12 @@ class MARLTrain(MARLBase):
 
         actions_all = np.concatenate(actions_all, axis=0)
         rewards_all = np.concatenate(rewards_all, axis=0)
-        ent_agents = []
-        for i_agent in range(actions_all.shape[1]):
-            actions = actions_all[:, i_agent]
-            _, counts = np.unique(actions, return_counts=True)
-            p = counts/counts.sum()
-            ent_agents.append((-p * np.log2(p)).sum().item())
+        ent_agents_stat = []
+        for i_agent in range(self.num_agents):
+            if entropy_agents[i_agent] == []:
+                ent_agents_stat.append(-1.0)
+            else:
+                ent_agents_stat.append(np.mean(entropy_agents[i_agent]).item())
         # 4. 训练更新
         train_info = self.train_step(batch_size=batch_size, update_steps=update_steps)
         
@@ -1037,7 +1042,7 @@ class MARLTrain(MARLBase):
         del visual_data_all
         gc.collect()
         train_info.update(
-            {"entropy": ent_agents, 
+            {"entropy": ent_agents_stat, 
              "visual_data": visual_data_image,
              "reward_mean": np.mean(rewards_all, axis=0),
              "reward_std": np.std(rewards_all, axis=0),
@@ -1146,7 +1151,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         logger.info(f"{episode:0>5d} success_agents: {_format_container(success_agents_percentile)}")
         
         for k,v in success_agents_percentile.items():
-            summary_writer.add_scalar(f"train/success_agentsAll/{k}", v, episode)
+            summary_writer.add_scalar(f"train_success(image)/P{k}", v, episode)
         logger.info(f"{episode:0>5d} epsilon_agents: {_format_container(_calc_percentile(episode_info['epsilon_agents']))}")
         
         for i_agent, agent in enumerate(trainer.agents):
@@ -1156,7 +1161,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
                 f"{_format_container(agent_stat)}"
             )
             for k, v in agent_stat['reward'].items():
-                summary_writer.add_scalar(f"train/success/agent_{i_agent:0>3d}/{k}", v, episode)
+                summary_writer.add_scalar(f"train_reward_agent{i_agent:0>2d}/P{k}", v, episode)
         
         target_q_stats = _calc_percentile(episode_info['target_q'])
         logger.info(f"{episode:0>5d} target_q: {_format_container(target_q_stats)}") 
@@ -1178,8 +1183,8 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
                 
         for i_agent in range(env_tr.num_agents):
             for name in ['loss', 'entropy', 'reward_mean', 'reward_std','tderr_mean_smoothed_agents','tderr_std_agents','tderr_mean_agents']:
-                summary_writer.add_scalar(f"train/{name}/agent{i_agent:0>3d}", episode_info[name][i_agent], episode)
-            summary_writer.add_scalar(f"train/epsilon/agent_{i_agent:0>3d}", trainer.agents[i_agent].epsilon, episode)
+                summary_writer.add_scalar(f"train_{name}_agent{i_agent:0>2d}", episode_info[name][i_agent], episode)
+            summary_writer.add_scalar(f"train_epsilon_agent{i_agent:0>3d}", trainer.agents[i_agent].epsilon, episode)
        
         # TODO: move this into env class
         env_tr.init_jitter = env_tr.init_jitter * env_tr.decay_jitter 
@@ -1197,8 +1202,8 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
             trainer.save(os.path.join(outdir, "last.pth"))
             evaluater.load(os.path.join(outdir, "last.pth"))
             success_stat = evaluater.stat_success(env_te,sampling=1) # sampling > 1 to make eval faster
-            summary_writer.add_scalar("eval/success/all", success_stat['all'], episode)
-            summary_writer.add_scalar("eval/success/agents", success_stat['agents'], episode)
+            summary_writer.add_scalar("eval_success(image)/avg", success_stat['all'], episode)
+            summary_writer.add_scalar("eval_success(agents)/avg", success_stat['agents'], episode)
             logger.info(
                 f"episode {episode:0>4d}|"
                 f"eval sucess: {_format_container(success_stat['agents'])}"
@@ -1241,11 +1246,11 @@ class MARLEval(MARLBase):
                 "agents": np.mean(success_stat['agents']), 
                 "agent_mask":np.mean(success_stat['agent_mask'],axis=0).flatten().tolist()}
 
-    def run_episode(self, env):
+    def run_episode(self, env, visual_mode="image", visual_size=256):
         # 重置环境，获取初始状态列表 [state_0, state_1, ..., state_k]
         states,_ = env.reset()
         actions_all = []
-        visual_data_all = [env.get_visual_data()]
+        visual_data_all = [env.get_visual_data(size=visual_size)]
         rewards_all = []
         dxdy_all = np.zeros((self.num_agents, 2), dtype=np.float32)
         success: bool = False
@@ -1253,7 +1258,7 @@ class MARLEval(MARLBase):
             actions = []
             # 1. 并行选择动作
             for i, agent in enumerate(self.agents):
-                action = agent.select_action(states[i], env.xy_agents[i], env.actions)
+                action,_ = agent.select_action(states[i], env.xy_agents[i], env.actions)
                 actions.append(action)
                 dxdy_all[i, :] += np.array(env.actions[action])
             actions_all.append(np.array(actions).astype(np.int32).reshape(1, -1))
@@ -1261,7 +1266,7 @@ class MARLEval(MARLBase):
             # 2. 执行动作，与环境交互
             next_states, rewards, dones, truncated, info = env.step(actions)
 
-            visual_data_all += [env.get_visual_data()]
+            visual_data_all += [env.get_visual_data(size=visual_size)]
             rewards_all.append(np.array(rewards).astype(np.float32).reshape(1, -1))
             states = next_states
             
@@ -1282,12 +1287,17 @@ class MARLEval(MARLBase):
             _, counts = np.unique(actions, return_counts=True)
             p = counts/counts.sum()
             ent_agents.append((-p * np.log2(p)).sum())
-                
-        visual_data = torch.from_numpy(np.concatenate([np.transpose(d, (2, 0, 1))[None] for d in visual_data_all], axis=0))
-        visual_data_image = make_grid(visual_data, nrow=10, padding=5, normalize=False).permute(1, 2, 0).numpy()
+        if visual_mode.lower() in {"image", "img"}:
+            visual_data = torch.from_numpy(np.concatenate([np.transpose(d, (2, 0, 1))[None] for d in visual_data_all], axis=0))
+            visual_data_image = make_grid(visual_data, nrow=10, padding=5, normalize=False).permute(1, 2, 0).numpy()
+        elif visual_mode.lower() in {"mp4","video"}:
+            visual_data_image = [ cv2.cvtColor(v, cv2.COLOR_BGR2RGB) for v in visual_data_all]
+        else:
+            assert False, f"invalid visual mode: {visual_mode}" 
+             
         eval_info = {
             "entropy": ent_agents,
-            "visual_data": visual_data_image.copy(),
+            "visual_data": visual_data_image,
             "reward_mean": np.mean(rewards_all, axis=0),
             "reward_std": np.std(rewards_all, axis=0),
             "dxdy": dxdy_all,
@@ -1312,12 +1322,11 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     actions = cfg.get("actions", [[1, 0], [-1, 0], [0, 1], [0, -1]])
     reward_scale = cfg.get("reward_scale", 10.0)
     dataset_size_max = cfg.get("dataset_size_max", None)
-    agent_init_xy = cfg.get("agent",{}).get("init_xy_mode","random")
+    agent_xy_init_method = cfg.get("agent",{}).get("xy_init_method","random")
     shared_patch_encoder = cfg.get("shared_patch_encoder", True)
     use_abs_dist_as_reward = cfg.get("env",{}).get("use_abs_dist_as_reward",True) 
     target_range_steps = cfg.get("training",{}).get("target_range_steps",(1,))
-
-
+    agent_action_selection_mode = cfg.get("agent_action_selection_mode", "dfs")
 
 
     outdir = os.path.join(exp_dir, "test")
@@ -1329,6 +1338,8 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     logger.info(f"dataset: {dataset_root}")
     logger.info(f"use_abs_dist_as_reward: {use_abs_dist_as_reward}")
     logger.info(f"target_range_steps: {target_range_steps}")
+  
+    
     
     input_channels = 3 * history_len
     input_shape = (1, input_channels, rf_size, rf_size)
@@ -1337,7 +1348,8 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     env = MARLEnv(dataset_root, split="test", face_size=face_size, rng=rng,
                   rf_size=rf_size, history_len=history_len,
                   actions=actions, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
-                  max_steps=max_steps, random_init_xy=random_init_xy, 
+                  max_steps=max_steps, 
+                  agent_xy_init_method=agent_xy_init_method,
                   use_abs_dist_as_reward=use_abs_dist_as_reward,
                   target_range_steps=(target_range_steps[-1],))
     eval = MARLEval(
@@ -1346,6 +1358,7 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
         n_actions=n_actions,
         device=device,
         rng = rng,
+        agent_action_selection_mode=agent_action_selection_mode,
         use_weight_sharing=shared_patch_encoder
         )
     logger.info(f"dataset size {len(env)}")
@@ -1355,9 +1368,19 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     
     for episode in range(len(env)):
         eval.episode_count = episode
-        episode_info = eval.run_episode(env)
+        episode_info = eval.run_episode(env,visual_mode="video")
         logger.info(f"""Episode {episode}|success: {episode_info['success']}|success_agents: {episode_info['success_agents']}""")
-        cv2.imwrite(os.path.join(outdir, f"{episode:0>8d}.jpg"), episode_info['visual_data'])
+        fps = 8
+        clip = ImageSequenceClip(episode_info['visual_data'],fps=fps) 
+        clip.write_videofile(
+            os.path.join(outdir, f"{episode:0>8d}.mp4"),
+            fps=fps,
+            codec = "libx264",
+            preset = "ultrafast",
+            audio_codec = "aac"
+        )
+        del episode_info['visual_data']
+        #cv2.imwrite(os.path.join(outdir, f"{episode:0>8d}.jpg"), episode_info['visual_data'])
     
 if __name__ == "__main__":
     Fire(
