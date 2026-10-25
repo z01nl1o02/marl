@@ -16,7 +16,8 @@
 - [ ] 基于 td-err 设置 replay buffer 中样本权重
 - [ ] 验证 history_len 对训练的影响
 - [ ] 验证 epsilon_decay 对训练的影响
-- [ ] 把全图缩放后，融入 agent 的输入信号，增加全局信息
+- [x] 把全图缩放后，融入 agent 的输入信号，增加全局信息
+- [ ] 全图上标记自身位置，然后再融入obs
 - [x] 使用 mean face 优化初始位置
 - [x] 共享 embeddding 层,只用一个Optimizer做更新共享层(使用多个 agent 对应 loss 的均值做backward)
 - [x] replay buffer中不要直接存储obs, 而是obs的索引，避免重复的帧被多次存储
@@ -107,10 +108,11 @@ def _calc_percentile(data:Iterable, P = (25,50,75,90)):
 
 
 class ReplayBuffer:
-    def __init__(self, capacity=10000, rng:None|np.random.Generator = None):
+    def __init__(self, use_global_view:bool, capacity=10000, rng:None|np.random.Generator = None):
         self.buffer = deque(maxlen=capacity)
         self.image_pool:dict[int, dict] = {}
         self.rng = rng if rng else np.random.default_rng(42)
+        self.use_global_view = use_global_view
 
     def reset(self):
         self.buffer.clear()
@@ -165,7 +167,12 @@ class ReplayBuffer:
             # state_xy: (history_len, 2)
             # state: (history_len*3, rf_size, rf_size)
             history_len, _ = state_xy.shape
-            states = np.zeros((history_len*3, rf_size, rf_size),dtype=np.float32)
+            if self.use_global_view:
+                states = np.zeros((history_len*3+3, rf_size, rf_size),dtype=np.float32)
+                gview = cv2.resize(self.image_pool[image_id]['image'], (rf_size, rf_size), interpolation=cv2.INTER_AREA)
+                states[-3:] = np.transpose(gview,(2,0,1))
+            else:
+                states = np.zeros((history_len*3, rf_size, rf_size),dtype=np.float32)
             state_xy = state_xy.reshape(-1,2)
             for ixy in range(state_xy.shape[0]):
                 x,y = state_xy[ixy]
@@ -361,6 +368,7 @@ class MARLEnv:
                  target_range_steps: tuple[int],
                  use_abs_dist_as_reward:bool,
                  rng: np.random.Generator,
+                 use_global_view: bool,
                  reward_scale: float = 10.0,
                  history_len: int = 1, dataset_size_max: int | None = None, max_steps: int = 1000,
                  agent_xy_init_method: str = "random"):
@@ -383,6 +391,7 @@ class MARLEnv:
         self.resize_method = cv2.INTER_AREA
 
         self.rf_size = rf_size
+        self.use_global_view = use_global_view
 
         self.current_image, self.current_image_patched = None, None
         self.xy_targets = None
@@ -518,6 +527,7 @@ class MARLEnv:
         return roi_data
 
     def get_observation(self) -> tuple[np.ndarray, np.ndarray]:
+        # any modification MUST be copied to RepalyBuffer
         assert self.current_file_id >= 0 and self.current_file_id < len(self.dataset)
         for i_agent, (x, y) in enumerate(self.xy_agents):
             data = self._crop_roi((x, y))
@@ -525,11 +535,17 @@ class MARLEnv:
             self.history_obs_agents[i_agent].append(data)
             xy = np.array([x,y]).reshape(1,1,2)
             self.history_xy_agents[i_agent].append(xy)
+        if self.use_global_view:
+            gview = cv2.resize(self.current_image, (self.rf_size,self.rf_size), interpolation=cv2.INTER_AREA)
+            gview = np.transpose(gview,(2,0,1))[None]
+        
         obs_all = []
         xy_all = []
         for i_agent in range(self.num_agents):
-            obs = np.concatenate([d for d in self.history_obs_agents[i_agent]], axis=1)
-            obs_all.append(obs)
+            obs_agent = np.concatenate([d for d in self.history_obs_agents[i_agent]], axis=1)
+            if self.use_global_view:
+                obs_agent = np.concatenate([obs_agent,gview],axis=1)
+            obs_all.append(obs_agent)
             xy = np.concatenate([d for d in self.history_xy_agents[i_agent]], axis=1)
             xy_all.append(xy)
         obs_data = np.concatenate(obs_all, axis=0)
@@ -676,6 +692,7 @@ class Agent:
                  agent_action_selection_mode:str,
                  replay_buffer_size:int,
                  rng: np.random.Generator,
+                 use_global_view: bool,
                  lr=1e-3, # adam
                  device: str = "cuda:0",
                  epsilon=0.6, epsilon_decay=0.8, epsilon_min=0.05, 
@@ -694,7 +711,9 @@ class Agent:
         self.epsilon_min = epsilon_min
         self.agent_action_selection_mode = agent_action_selection_mode
         self.rng = rng
-        self.replay_buffer = ReplayBuffer(capacity=replay_buffer_size, rng=rng)  # eat up memory!!! but have to be larger than max_step
+        self.replay_buffer = ReplayBuffer(capacity=replay_buffer_size, 
+                                          rng=rng, 
+                                          use_global_view=use_global_view)  # eat up memory!!! but have to be larger than max_step
 
         self.policy_net = CollabDQN(input_shape, n_actions, patch_encoder=shared_patch_encoder)
         self.policy_net.to(self.device)
@@ -758,6 +777,7 @@ class MARLBase:
                  agent_action_selection_mode:str,
                  replay_buffer_size:int,
                  rng: np.random.Generator,
+                 use_global_view: bool,
                  epsilon_decay: float = 0.99,
                  device: str = "cuda:0", 
                  use_weight_sharing=False, 
@@ -788,6 +808,7 @@ class MARLBase:
                 n_actions=n_actions,
                 replay_buffer_size=replay_buffer_size,
                 device=device,
+                use_global_view = use_global_view,
                 rng=rng,
                 epsilon_decay=epsilon_decay,
                 shared_patch_encoder=self.shared_patch_encoder,
@@ -834,6 +855,7 @@ class MARLTrain(MARLBase):
                  replay_buffer_size:int,
                  epsilon_decay:float,
                  rng : np.random.Generator,
+                 use_global_view: bool,
                  gamma: float = 0.99,
                  device: str = "cuda:0", 
                  use_weight_sharing=False, 
@@ -845,6 +867,7 @@ class MARLTrain(MARLBase):
                          n_actions=n_actions,
                          device=device,
                          rng = rng,
+                         use_global_view=use_global_view,
                          epsilon_decay=epsilon_decay,
                          replay_buffer_size=replay_buffer_size,
                          use_weight_sharing=use_weight_sharing, 
@@ -1077,6 +1100,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     freezing_success_agent = cfg.get("training",{}).get("freezing_success_agent",False)
     target_range_steps = cfg.get("training",{}).get("target_range_steps",(1,))
     training_loss = cfg.get("training",{}).get("loss", "mse")
+    agent_use_global_view = cfg.get("agent",{}).get("use_global_view",False)
     
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     exp_name = f"{os.path.splitext(os.path.basename(config_file))[0]}_{desc}"
@@ -1094,15 +1118,19 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     logger.info(f"use_double_dqn: {agent_use_double_dqn}")
 
     input_channels = 3 * history_len
+    if agent_use_global_view:
+        input_channels += 3
     input_shape = (1, input_channels, rf_size, rf_size)
     n_actions = len(actions)
     logger.info(f"face size: {face_size}") 
     env_tr = MARLEnv(dataset_root, split="train", rng=rng, face_size=face_size, rf_size=rf_size, history_len=history_len,
                      actions=actions, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
+                     use_global_view=agent_use_global_view,
                      max_steps=max_steps, agent_xy_init_method=agent_xy_init_method,use_abs_dist_as_reward=use_abs_dist_as_reward,
                      target_range_steps=target_range_steps)
     env_te = MARLEnv(dataset_root, split="test", rng=rng, face_size=face_size, rf_size=rf_size, history_len=history_len,
                      actions=actions, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
+                     use_global_view=agent_use_global_view,
                      max_steps=max_steps, agent_xy_init_method=agent_xy_init_method,use_abs_dist_as_reward=use_abs_dist_as_reward,
                      target_range_steps=(target_range_steps[-1],))
     trainer = MARLTrain(
@@ -1111,6 +1139,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         n_actions=n_actions,
         device=device,
         rng = rng,
+        use_global_view=agent_use_global_view,
         use_double_dqn=agent_use_double_dqn,
         training_loss=training_loss,
         replay_buffer_size=max_steps*100, # make replay buffer larger enough
@@ -1125,6 +1154,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         n_actions=n_actions,
         device=device,
         rng = rng,
+        use_global_view=agent_use_global_view,
         use_weight_sharing=shared_patch_encoder,  # Collab-DQN 
         agent_action_selection_mode=agent_action_selection_mode
     )
@@ -1225,12 +1255,14 @@ class MARLEval(MARLBase):
     def __init__(self, num_agents, input_shape, n_actions, 
                  agent_action_selection_mode:str,
                  rng: np.random.Generator,
+                 use_global_view: bool,
                  device: str = "cuda:0", use_weight_sharing=False):
         super().__init__(num_agents=num_agents, 
                          input_shape=input_shape, 
                          n_actions=n_actions,
                          device=device,
                          rng = rng,
+                         use_global_view=use_global_view,
                          replay_buffer_size=1,
                          use_weight_sharing=use_weight_sharing, flag_train=False,
                          agent_action_selection_mode=agent_action_selection_mode)
@@ -1329,6 +1361,7 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     use_abs_dist_as_reward = cfg.get("env",{}).get("use_abs_dist_as_reward",True) 
     target_range_steps = cfg.get("training",{}).get("target_range_steps",(1,))
     agent_action_selection_mode = cfg.get("agent_action_selection_mode", "dfs")
+    agent_use_global_view = cfg.get("agent",{}).get("use_global_view",False)
 
 
     outdir = os.path.join(exp_dir, "test")
@@ -1344,6 +1377,8 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     
     
     input_channels = 3 * history_len
+    if agent_use_global_view:
+        input_channels += 3
     input_shape = (1, input_channels, rf_size, rf_size)
     n_actions = len(actions)
     logger.info(f"face size: {face_size}") 
@@ -1351,6 +1386,7 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
                   rf_size=rf_size, history_len=history_len,
                   actions=actions, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
                   max_steps=max_steps, 
+                  use_global_view=agent_use_global_view,
                   agent_xy_init_method=agent_xy_init_method,
                   use_abs_dist_as_reward=use_abs_dist_as_reward,
                   target_range_steps=(target_range_steps[-1],))

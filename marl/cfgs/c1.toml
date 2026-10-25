@@ -15,6 +15,7 @@ max_steps = 200
 batch_size = 64
 reward_scale = 100.0
 
+#actions = [[2,0], [-2,0], [0,2], [0,-2], [0,0],[5,0],[-5,0],[0,5],[0,-5],[1,0],[-1,0],[0,1],[0,-1]]
 actions = [[2,0], [-2,0], [0,2], [0,-2], [0,0]]
 
 #dataset_size_max = 300
@@ -31,6 +32,7 @@ agent_action_selection_mode = "bfs" # dfs
 [agent]
 xy_init_method = "heatmap"  # random / fixed
 use_double_dqn = true
+use_global_view = true
 
 [env]
 use_abs_dist_as_reward = false
