@@ -743,9 +743,8 @@ class Agent:
                 x, y = current_xy
                 nx, ny = int(actions[i_action][0] + x), int(actions[i_action][1] + y)
                 self.explorer.set_visit((nx, ny))
-                
                 p = torch.softmax(q_values,dim=-1)
-                return i_action, {"entropy": (-p*torch.log(p)).mean().item()}
+                return i_action, {"entropy": (-p*torch.log(p)).sum().item()}
 
     def update_target_network(self):
         self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -1252,15 +1251,18 @@ class MARLEval(MARLBase):
         actions_all = []
         visual_data_all = [env.get_visual_data(size=visual_size)]
         rewards_all = []
+        entropy_agents = [[] for _ in range(self.num_agents)]
         dxdy_all = np.zeros((self.num_agents, 2), dtype=np.float32)
         success: bool = False
         while True:
             actions = []
             # 1. 并行选择动作
             for i, agent in enumerate(self.agents):
-                action,_ = agent.select_action(states[i], env.xy_agents[i], env.actions)
+                action, info = agent.select_action(states[i], env.xy_agents[i], env.actions)
                 actions.append(action)
                 dxdy_all[i, :] += np.array(env.actions[action])
+                if 'entropy' in info:
+                    entropy_agents[i].append(info['entropy']) 
             actions_all.append(np.array(actions).astype(np.int32).reshape(1, -1))
             
             # 2. 执行动作，与环境交互
@@ -1281,12 +1283,12 @@ class MARLEval(MARLBase):
 
         actions_all = np.concatenate(actions_all, axis=0)
         rewards_all = np.concatenate(rewards_all, axis=0)
-        ent_agents = []
-        for i_agent in range(actions_all.shape[1]):
-            actions = actions_all[:, i_agent]
-            _, counts = np.unique(actions, return_counts=True)
-            p = counts/counts.sum()
-            ent_agents.append((-p * np.log2(p)).sum())
+        ent_agents_stat = [0 for _ in range(self.num_agents)]
+        for i_agent in range(self.num_agents):
+            if entropy_agents[i_agent] == []:
+                ent_agents_stat[i_agent] = -99.0
+            else:
+                ent_agents_stat[i_agent] = np.mean(entropy_agents[i_agent]).item()
         if visual_mode.lower() in {"image", "img"}:
             visual_data = torch.from_numpy(np.concatenate([np.transpose(d, (2, 0, 1))[None] for d in visual_data_all], axis=0))
             visual_data_image = make_grid(visual_data, nrow=10, padding=5, normalize=False).permute(1, 2, 0).numpy()
@@ -1296,7 +1298,7 @@ class MARLEval(MARLBase):
             assert False, f"invalid visual mode: {visual_mode}" 
              
         eval_info = {
-            "entropy": ent_agents,
+            "entropy": ent_agents_stat,
             "visual_data": visual_data_image,
             "reward_mean": np.mean(rewards_all, axis=0),
             "reward_std": np.std(rewards_all, axis=0),
@@ -1366,11 +1368,15 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     eval.load(weights_file)
     logger.warning(f"loading weights from {weights_file}")
     
+    fps = 8
     for episode in range(len(env)):
         eval.episode_count = episode
         episode_info = eval.run_episode(env,visual_mode="video")
-        logger.info(f"""Episode {episode}|success: {episode_info['success']}|success_agents: {episode_info['success_agents']}""")
-        fps = 8
+        logger.info(f"{episode:0>4d}|"
+                    f"success: {episode_info['success']:3.2f}|"
+                    f"success_agents: {episode_info['success_agents']:3.2f}|"
+                    f"entropy: {np.mean(episode_info['entropy']).item():3.2f}"
+                    )
         clip = ImageSequenceClip(episode_info['visual_data'],fps=fps) 
         clip.write_videofile(
             os.path.join(outdir, f"{episode:0>8d}.mp4"),
