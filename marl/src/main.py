@@ -17,7 +17,7 @@
 - [ ] 验证 history_len 对训练的影响
 - [ ] 验证 epsilon_decay 对训练的影响
 - [x] 把全图缩放后，融入 agent 的输入信号，增加全局信息
-- [ ] 全图上标记自身位置，然后再融入obs
+- [ ] 全图上标记自身位置,然后再融入obs
 - [x] 使用 mean face 优化初始位置
 - [x] 共享 embeddding 层,只用一个Optimizer做更新共享层(使用多个 agent 对应 loss 的均值做backward)
 - [x] replay buffer中不要直接存储obs, 而是obs的索引，避免重复的帧被多次存储
@@ -789,12 +789,12 @@ class MARLBase:
         self.num_agents = num_agents
         self.use_weight_sharing = use_weight_sharing
         
-            
+        self.flag_train = flag_train
         # 如果使用权重共享，创建一个共享的策略网络
         if use_weight_sharing:
             self.shared_patch_encoder = PatchEncoder(input_shape)
             self.optimizer = torch.optim.Adam(self.shared_patch_encoder.parameters(),
-                                              lr = 1e-3)
+                                              lr = 1e-3) # FIXME: make it an parameter
         else:
             self.shared_patch_encoder = None
             self.optimizer = None
@@ -847,6 +847,17 @@ class MARLBase:
             self.shared_patch_encoder.load_state_dict(self.agents[0].policy_net.patch_encoder.state_dict())
             for k in range(1, len(self.agents)):
                 self.agents[k].policy_net.patch_encoder = self.shared_patch_encoder  # set shared encoder!!!!!
+                
+        if self.flag_train:
+            # rebuild optimizer
+            if self.shared_patch_encoder is not None:
+                self.optimizer = torch.optim.Adam(self.shared_patch_encoder.parameters(),
+                                              lr = 1e-3)     
+                # FIXME: let agent set optimizer for itself
+                for agent in self.agents:
+                    agent.optimizer = optim.Adam(agent.policy_net.unshared_parameters(), lr=1e-3)
+            else:
+                pass # FIXME
         return
 
 class MARLTrain(MARLBase):
@@ -1123,7 +1134,8 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     input_shape = (1, input_channels, rf_size, rf_size)
     n_actions = len(actions)
     logger.info(f"face size: {face_size}") 
-    env_tr = MARLEnv(dataset_root, split="train", rng=rng, face_size=face_size, rf_size=rf_size, history_len=history_len,
+    # FIXME: train net with trainset
+    env_tr = MARLEnv(dataset_root, split="test", rng=rng, face_size=face_size, rf_size=rf_size, history_len=history_len,
                      actions=actions, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
                      use_global_view=agent_use_global_view,
                      max_steps=max_steps, agent_xy_init_method=agent_xy_init_method,use_abs_dist_as_reward=use_abs_dist_as_reward,
@@ -1148,6 +1160,9 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         use_weight_sharing=shared_patch_encoder,  # Collab-DQN 
         freezing_success_agent=freezing_success_agent
     )
+    if weights_file is not None and os.path.exists(weights_file):
+        trainer.load(weights_file)
+        logger.warning(f"load weights file: {weights_file}")
     evaluater = MARLEval(
         num_agents=env_tr.num_agents,
         input_shape=input_shape,
@@ -1396,6 +1411,7 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
         n_actions=n_actions,
         device=device,
         rng = rng,
+        use_global_view=agent_use_global_view,
         agent_action_selection_mode=agent_action_selection_mode,
         use_weight_sharing=shared_patch_encoder
         )
