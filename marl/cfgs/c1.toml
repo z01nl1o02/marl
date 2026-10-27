@@ -20,7 +20,6 @@ actions = [[2,0], [-2,0], [0,2], [0,-2], [0,0]]
 
 #dataset_size_max = 300
 
-
 update_steps = 30
 
 shared_patch_encoder = true # 共享编码器

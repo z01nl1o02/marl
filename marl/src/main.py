@@ -30,6 +30,7 @@
 - [x] 每个 agent 单独统计成功率
 - [x] 支持 huber loss
 - [x] 统计 target_q 的取值范围, 缩放到合适的范围
+- [x] 对于success赋予一个足够的reward
 -----------------DEPERATED-----------------------------------------
 - [ ] replay buffer中存储image path + 坐标,动态生成obs 
 - [ ] replay buffer中obs采用uint8存储. 
@@ -593,6 +594,9 @@ class MARLEnv:
             
         target_range = self.target_range_steps[self.current_target_range_step_idx]
         success_mask = [dist_new[i] < target_range for i in range(self.num_agents)]
+        
+        # set a large reward value for successful agent
+        reward += 10 * np.asarray(success_mask)
        
         info = {"success": np.all(success_mask),
                 "num_steps": self.num_steps,
