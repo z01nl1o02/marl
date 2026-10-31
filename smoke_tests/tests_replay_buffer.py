@@ -6,20 +6,23 @@ import torch
 sys.path.insert(0, str(Path(__file__).absolute().parent / ".."))
 
 def test_states_identity():
-    from marl.src.main import MARLEnv,ReplayBuffer
+    from marl.src.main import MARLEnv,ReplayBuffer,set_seed
     ACTIONS = [(-1,0), (1,0), (0,1),(0,-1)]
     HISTORY_LEN = 2
     MAX_STEPS = 512
     MAX_TEST_STEPS = 4 * MAX_STEPS
     BATCH_SIZE = 64
+    rng = set_seed(42)
     env = MARLEnv(dataset_root="D:\\dataset\\WFLW",split="train",rf_size=64, face_size=512,actions=ACTIONS,
                   target_range_steps=(10,5), use_abs_dist_as_reward=False, 
                   history_len=HISTORY_LEN,
                   max_steps = MAX_STEPS,
-                  dataset_size_max=64)
+                  dataset_size_max=64,
+                  rng = rng,
+                  use_global_view=True)
     rng = np.random.default_rng(seed=42)
     replay_buffers = [
-        ReplayBuffer(capacity=max((MAX_TEST_STEPS,10000)),rng=rng) for _ in range(env.num_agents)]
+        ReplayBuffer(capacity=max((MAX_TEST_STEPS,10000)),rng=rng,use_global_view=True) for _ in range(env.num_agents)]
     
     states_gt = []
     states, states_xy = env.reset()
