@@ -6,37 +6,34 @@
 # max_steps: 300 -> 6000
 # num_episode: 5000 -> 100
 
+[env]
 face_size = 512
 rf_size = 64
-num_episode = 5000 # 应该不低于 dataset_size_max
-history_len = 2 #5
 max_steps = 200
-
-batch_size = 64
-reward_scale = 100.0
-
-#actions = [[2,0], [-2,0], [0,2], [0,-2], [0,0],[5,0],[-5,0],[0,5],[0,-5],[1,0],[-1,0],[0,1],[0,-1]]
-actions = [[2,0], [-2,0], [0,2], [0,-2], [0,0]]
-
 #dataset_size_max = 300
-
-update_steps = 30
-
-shared_patch_encoder = true # 共享编码器
-
-target_update_freq = 4
-
-agent_action_selection_mode = "bfs" # dfs
+history_len = 2 #5
+reward_scale = 100.0
+use_abs_dist_as_reward = false
+use_global_view = true
+target_range_steps = [20,15,10,8]
 
 [agent]
+actions = [[2,0], [-2,0], [0,2], [0,-2], [0,0]]
+
+shared_patch_encoder = true # 共享编码器
 xy_init_method = "heatmap"  # random / fixed
 use_double_dqn = true
-use_global_view = true
 
-[env]
-use_abs_dist_as_reward = false
+action_selection_mode = "bfs" # dfs
 
 [training]
-loss = "huber" # huber, mse
+batch_size = 64
+update_steps = 30
+target_update_freq = 4
 freezing_success_agent = true 
-target_range_steps = [30,10,5]
+seed = 42
+num_loop = 5000 # 应该不低于 dataset_size_max
+loss = "huber" # huber, mse
+num_samples_to_enable_training = 100
+
+

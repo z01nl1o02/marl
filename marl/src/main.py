@@ -4,7 +4,7 @@
 - [x] 支持广度优先和深度优先agent_action_selection_mode
 - [x] ACTION支持[0,0], 允许 agent 保持原地静止
 - [x] freezing_success_agent 允许已经到达目标位置的 agent 停止更新replay和位置
-- [ ] 把参数分层
+- [x] 把参数分层 by pydantic
 - [x] 支持"课程", 先放宽"成功"的定义,当成功率足够高以后再逐渐提高"成功"质量
 - [ ] 退火 epsilon 替代动作选择
 - [x] 分析 select_action 是否能覆盖解空间   
@@ -17,6 +17,7 @@
 - [x] 基于 td-err 设置 replay buffer 中样本权重
 - [ ] 验证 history_len 对训练的影响
 - [ ] 验证 epsilon_decay 对训练的影响
+- [ ] agent 在 target 滞留足够时间才判定success
 - [x] 把全图缩放后，融入 agent 的输入信号，增加全局信息
 - [ ] 全图上标记自身位置,然后再融入obs
 - [x] 累计到一定数量样本之前，不用启动训练
@@ -24,7 +25,6 @@
 - [x] 共享 embeddding 层,只用一个Optimizer做更新共享层(使用多个 agent 对应 loss 的均值做backward)
 - [x] replay buffer中不要直接存储obs, 而是obs的索引，避免重复的帧被多次存储
 - [x] 每步施加惩罚，避免太多零激励样本
-- [ ] 把连续 20 episode  success 统计值大于80% s作为课程切换的依据
 - [x] 对DQN参数初始化
 - [x] 基于 net 输出 action prob 统计 entropy
 - [x] 支持 heatmap 做初始化
@@ -33,6 +33,7 @@
 - [x] 支持 huber loss
 - [x] 统计 target_q 的取值范围, 缩放到合适的范围
 - [x] 对于success赋予一个足够的reward  !!milestone
+- [x] 把连续 20 episode  success 统计值大于80% s作为课程切换的依据
 -----------------DEPERATED-----------------------------------------
 - [ ] replay buffer中存储image path + 坐标,动态生成obs 
 - [ ] replay buffer中obs采用uint8存储. 
@@ -62,12 +63,83 @@ from collections import deque
 from torch.utils.tensorboard.writer import SummaryWriter
 from datetime import datetime
 import tomllib
+from pathlib import Path
 import shutil
 import gc
 from moviepy import ImageSequenceClip
 from typing import Iterable
+from pydantic import BaseModel, Field, ConfigDict
+
 SAVE_REPLAY_BUFFER = False # 保存repaly buffer需要较多内存
 
+class EnvConfig(BaseModel):
+    model_config = ConfigDict(
+        extra = "forbid",
+        frozen=True,
+        arbitrary_types_allowed=True
+    )
+    face_size: int = 512
+    rf_size: int = 64
+    max_steps: int
+    dataset_size_max:int|None = None
+    history_len: int
+    reward_scale: float = 10.0
+    use_abs_dist_as_reward: bool = False
+    use_global_view: bool = False
+    target_range_steps: list[int]
+    
+class AgentConfig(BaseModel):
+    model_config = ConfigDict(
+        extra = "forbid",
+        frozen=True,
+        arbitrary_types_allowed=True
+    )
+    actions: list[tuple[int,int]]
+    shared_patch_encoder: bool = True
+    
+    xy_init_method: str
+    use_double_dqn: bool = True
+    action_selection_mode: str = "bfs"
+    
+class TrainingConfig(BaseModel):
+    model_config = ConfigDict(
+        extra = "forbid",
+        frozen=True,
+        arbitrary_types_allowed=True
+    )
+    num_loop: int
+    seed: int = 42
+    batch_size: int 
+    update_steps: int
+    target_update_freq: int    
+    loss: str = "huber"
+    freezing_success_agent: bool = True
+    num_samples_to_enable_training:int = 1000 
+    
+    
+class MARLConfig(BaseModel):
+    env: EnvConfig
+    agent: AgentConfig
+    training: TrainingConfig 
+    model_config = ConfigDict(
+        extra = "forbid",
+        frozen=True,
+        arbitrary_types_allowed=True
+    )
+ 
+def load_config(path: str) -> MARLConfig:
+    with open(Path(path),'rb') as f:
+        config_data = tomllib.load(f)
+    try:
+        config = MARLConfig(**config_data)
+        return config
+    except Exception as e:
+        print(f"!ERROR! {path}",
+              "================",
+              f"{e}")
+        raise
+    
+    
 
 def set_seed(seed:int) -> np.random.Generator:
     random.seed(seed)
@@ -116,7 +188,10 @@ class ReplayBuffer:
         # TODO: move following into toml
         self.max_priority = 10.0
         self.alpha = 0.6
-        self.beta = 0.4
+        self.beta_init = 0.4
+        self.beta = self.beta_init
+        self.beta_remained = 1 - self.beta
+        self.beta_decay = 0.9 # TODO: move it to TOML
         self.eps = 1e-6
         
         self.pos = 0
@@ -236,7 +311,8 @@ class ReplayBuffer:
         weights = weights / weights.max()
         return (states, actions, rewards, next_states, dones, 
                 {"indices":indices.copy(),
-                 "weights": weights.astype(np.float32)
+                 "weights": weights.astype(np.float32),
+                 "ratio": np.sum(probs[indices])
                  })
     def update_priorities(self, indices, td_errors):
         self.priorities[indices] = np.abs(td_errors) + self.eps
@@ -451,7 +527,7 @@ class MARLEnv:
             self.agent_xy_init_func = load_heatmap_provider(weights_file=weights_path, num_points=self.num_agents)
             logger.warning(f"load heatmap provider: {weights_path}")
             self.init_jitter = 0.2
-            self.decay_jitter = 0.9
+            self.decay_jitter = 0.95 # TODO: move it to toml
         else:
             self.agent_xy_init_func = None 
 
@@ -948,6 +1024,7 @@ class MARLTrain(MARLBase):
         loss_all = []
         target_q_all = []
         target_net_out_all = []
+        agents_sampling_probs = [[] for _ in range(self.num_agents)]
         for _ in range(update_steps):
             loss_agents = []
             optimizers_to_update = [] 
@@ -983,6 +1060,7 @@ class MARLTrain(MARLBase):
                     target_net_out_all.extend([qq.item() for qq in next_q.flatten().cpu()])
                     
                 tderr_agent = torch.abs(current_q.detach() - target_q).cpu()
+                agents_sampling_probs[iagent].append(batch_info['ratio'])
                 
                 agents_tderr_mean[iagent].append(torch.mean(tderr_agent).item())
                 agents_tderr_std[iagent].append(torch.std(tderr_agent).item())
@@ -1018,10 +1096,11 @@ class MARLTrain(MARLBase):
                 "tderr_std_agents": [np.mean(v_batch).item() if v_batch is not [] else 0 for v_batch in agents_tderr_std],
                 "tderr_mean_smoothed_agents": deepcopy(self.agents_tderr_smoothed),
                 "target_q": target_q_all,
-                "target_net_out": target_net_out_all
+                "target_net_out": target_net_out_all,
+                "sampling_prob_agents": [np.mean(agents_sampling_probs[i]) for i in range(self.num_agents)]
                 }
 
-    def run_episode(self, env, max_steps_collected: int = 100, batch_size: int = 64, update_steps=100, target_update_freq: int = 10):
+    def run_episode(self, env, max_steps_collected: int = 100, batch_size: int = 64, update_steps=100, target_update_freq: int = 10, num_samples_to_enable_training: int = 100):
         """
         运行一个完整的Episode，收集所有智能体的经验到共享缓冲区
         """
@@ -1093,7 +1172,7 @@ class MARLTrain(MARLBase):
         # 4. 训练更新
         buffer_size = min([len(agent.replay_buffer) for agent in self.agents])
         
-        if buffer_size >= 1000: # TODO: move this to toml
+        if buffer_size >= num_samples_to_enable_training:
             train_info = self.train_step(batch_size=batch_size, update_steps=update_steps)
        
             # 5. 衰减探索率
@@ -1125,7 +1204,8 @@ class MARLTrain(MARLBase):
                 "success_agents": tuple(success_agents),
                 "epsilon_agents": tuple([a.epsilon for a in self.agents]),
                 "start_training": True,
-                "buffer_size": buffer_size
+                "buffer_size": buffer_size,
+                "sampling_prob_agents": train_info['sampling_prob_agents']
                 }
             )
         else:
@@ -1133,79 +1213,62 @@ class MARLTrain(MARLBase):
         return train_info
     
 def train(config_file: str, dataset_root: str, desc: str = "marl", device: str = "cuda:0", weights_file: str | None = None, eval_freq: int = 10):
-    with open(config_file, 'rb') as f:
-        cfg = tomllib.load(f)
+    cfg = load_config(config_file)
+    rng = set_seed(cfg.training.seed)
+    
 
-    seed = cfg.get("seed",42)
-    rng = set_seed(seed)
-    face_size = cfg.get("face_size", 512)
-    rf_size = cfg.get('rf_size', 64)
-    num_episode = cfg.get("num_episode", 1000)
-    history_len = cfg.get("history_len", 5) # 占用内存
-    max_steps = cfg.get("max_steps", 1000)  # max steps each eposide
-    actions = cfg.get("actions", [[1, 0], [-1, 0], [0, 1], [0, -1]])
-    reward_scale = cfg.get("reward_scale", 10.0)
-    batch_size = cfg.get("batch_size", 64)
-    dataset_size_max = cfg.get("dataset_size_max", None)
-    agent_xy_init_method = cfg.get("agent",{}).get("xy_init_method","random")
-    agent_use_double_dqn = cfg.get("agent",{}).get("use_double_dqn",False)
-    update_steps = cfg.get("update_steps", 100)
-    shared_patch_encoder = cfg.get("shared_patch_encoder", True)
-    target_update_freq = cfg.get("target_update_freq", 10)
-    agent_action_selection_mode = cfg.get("agent_action_selection_mode", "dfs")
-    use_abs_dist_as_reward = cfg.get("env",{}).get("use_abs_dist_as_reward",True) 
-    # freezing_success_agent: 已经达到目标的agent不再更新replay buffer, 不再移动, 但依然参与训练(避免震荡)
-    freezing_success_agent = cfg.get("training",{}).get("freezing_success_agent",False)
-    target_range_steps = cfg.get("training",{}).get("target_range_steps",(1,))
-    training_loss = cfg.get("training",{}).get("loss", "mse")
-    agent_use_global_view = cfg.get("agent",{}).get("use_global_view",False)
     
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     exp_name = f"{os.path.splitext(os.path.basename(config_file))[0]}_{desc}"
-    outdir = os.path.join(os.path.dirname(os.path.basename(__file__)), "runs", f"{exp_name}_{timestamp}")
-    summary_writer = SummaryWriter(outdir, "marl")
+    outdir = Path(__file__).parent.parent.parent/"runs"/f"{exp_name}_{timestamp}"
+    summary_writer = SummaryWriter(str(outdir), "marl")
     shutil.copyfile(config_file, os.path.join(outdir, "cfg.toml"))
     logger.add(os.path.join(outdir, "marl.log"))
 
     logger.info(f"{cfg}")
     logger.info(f"device: {device}")
     logger.info(f"saved folder {outdir}")
-    logger.info(f"actions: {actions}")
-    logger.info(f"agent action selection model: {agent_action_selection_mode}")
-    logger.info(f"use_abs_dist_as_reward: {use_abs_dist_as_reward}")
-    logger.info(f"use_double_dqn: {agent_use_double_dqn}")
-
-    input_channels = 3 * history_len
-    if agent_use_global_view:
+    input_channels = 3 * cfg.env.history_len
+    if cfg.env.use_global_view:
         input_channels += 3
-    input_shape = (1, input_channels, rf_size, rf_size)
-    n_actions = len(actions)
-    logger.info(f"face size: {face_size}") 
+    input_shape = (1, input_channels, cfg.env.rf_size, cfg.env.rf_size)
+    n_actions = len(cfg.agent.actions)
+    logger.info(f"face size: {cfg.env.face_size}") 
     # FIXME: train net with trainset
-    env_tr = MARLEnv(dataset_root, split="test", rng=rng, face_size=face_size, rf_size=rf_size, history_len=history_len,
-                     actions=actions, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
-                     use_global_view=agent_use_global_view,
-                     max_steps=max_steps, agent_xy_init_method=agent_xy_init_method,use_abs_dist_as_reward=use_abs_dist_as_reward,
-                     target_range_steps=target_range_steps)
-    env_te = MARLEnv(dataset_root, split="test", rng=rng, face_size=face_size, rf_size=rf_size, history_len=history_len,
-                     actions=actions, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
-                     use_global_view=agent_use_global_view,
-                     max_steps=max_steps, agent_xy_init_method=agent_xy_init_method,use_abs_dist_as_reward=use_abs_dist_as_reward,
-                     target_range_steps=(target_range_steps[-1],))
+    env_tr = MARLEnv(dataset_root, split="test", rng=rng, face_size=cfg.env.face_size, 
+                     rf_size=cfg.env.rf_size, history_len=cfg.env.history_len,
+                     actions=cfg.agent.actions, reward_scale=cfg.env.reward_scale,
+                     dataset_size_max=cfg.env.dataset_size_max,
+                     use_global_view=cfg.env.use_global_view,
+                     max_steps=cfg.env.max_steps, 
+                     agent_xy_init_method=cfg.agent.xy_init_method,
+                     use_abs_dist_as_reward=cfg.env.use_abs_dist_as_reward,
+                     target_range_steps=cfg.env.target_range_steps)
+    env_te = MARLEnv(dataset_root, split="test", rng=rng, 
+                     face_size=cfg.env.face_size, rf_size=cfg.env.rf_size, 
+                     history_len=cfg.env.history_len,
+                     actions=cfg.agent.actions, 
+                     reward_scale=cfg.env.reward_scale, 
+                     dataset_size_max=cfg.env.dataset_size_max,
+                     use_global_view=cfg.env.use_global_view,
+                     max_steps=cfg.env.max_steps,
+                     agent_xy_init_method=cfg.agent.xy_init_method,
+                     use_abs_dist_as_reward=cfg.env.use_abs_dist_as_reward,
+                     target_range_steps=(cfg.env.target_range_steps[-1],))
     trainer = MARLTrain(
         num_agents=env_tr.num_agents,
         input_shape=input_shape,
         n_actions=n_actions,
         device=device,
         rng = rng,
-        use_global_view=agent_use_global_view,
-        use_double_dqn=agent_use_double_dqn,
-        training_loss=training_loss,
-        replay_buffer_size=max_steps*100, # make replay buffer larger enough
+        use_global_view=cfg.env.use_global_view,
+        use_double_dqn=cfg.agent.use_double_dqn,
+        training_loss=cfg.training.loss,
+        replay_buffer_size=cfg.env.max_steps*100, # make replay buffer larger enough
         epsilon_decay =0.95, 
-        agent_action_selection_mode=agent_action_selection_mode,
-        use_weight_sharing=shared_patch_encoder,  # Collab-DQN 
-        freezing_success_agent=freezing_success_agent
+        agent_action_selection_mode=cfg.agent.action_selection_mode,
+        use_weight_sharing=cfg.agent.shared_patch_encoder,  # Collab-DQN 
+        freezing_success_agent=cfg.training.freezing_success_agent
     )
     if weights_file is not None and os.path.exists(weights_file):
         trainer.load(weights_file)
@@ -1216,9 +1279,9 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         n_actions=n_actions,
         device=device,
         rng = rng,
-        use_global_view=agent_use_global_view,
-        use_weight_sharing=shared_patch_encoder,  # Collab-DQN 
-        agent_action_selection_mode=agent_action_selection_mode
+        use_global_view=cfg.env.use_global_view,
+        use_weight_sharing=cfg.agent.shared_patch_encoder,  # Collab-DQN 
+        agent_action_selection_mode=cfg.agent.action_selection_mode
     )
     logger.info(f"dataset size: train {len(env_tr)} | test {len(env_te)}")
 
@@ -1226,28 +1289,29 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         trainer.load(weights_file)
         logger.warning(f"loading weights from {weights_file}")
         
-       
+    success_ratio_EAM = 0.0 #
 
     top_eval_metric = np.finfo("float").min
-    for episode in range(num_episode):
-        trainer.episode_count = episode
+    for iloop in range(cfg.training.num_loop):
+        trainer.episode_count = iloop
         episode_info = trainer.run_episode(env_tr,
                                            #max_steps_collected: should be much smaller than replay buffer capacity. and resample 0.25 to training each episode
-                                           max_steps_collected=max([max_steps, 4*batch_size*update_steps//update_steps]), 
-                                           batch_size=batch_size, 
-                                           update_steps=update_steps,
-                                           target_update_freq=target_update_freq)
+                                           max_steps_collected=cfg.env.max_steps*10, 
+                                           batch_size=cfg.training.batch_size, 
+                                           update_steps=cfg.training.update_steps,
+                                           target_update_freq=cfg.training.target_update_freq,
+                                           num_samples_to_enable_training = cfg.training.num_samples_to_enable_training)
       
         if not episode_info['start_training']: # TODO: collect samples before episode-loop
             buffer_size = episode_info['buffer_size']
-            logger.info(f"{episode:0>5d} training is not started| buffer size {buffer_size:5d}")
+            logger.info(f"{iloop:0>5d} training is not started| buffer size {buffer_size:5d}")
             continue
         success_agents_percentile = _calc_percentile(episode_info['success_agents'])
-        logger.info(f"{episode:0>5d} success_agents: {_format_container(success_agents_percentile)}")
+        logger.info(f"{iloop:0>5d} success_agents: {_format_container(success_agents_percentile)}")
         
         for k,v in success_agents_percentile.items():
-            summary_writer.add_scalar(f"train_success(image)/P{k}", v, episode)
-        logger.info(f"{episode:0>5d} epsilon_agents: {_format_container(_calc_percentile(episode_info['epsilon_agents']))}")
+            summary_writer.add_scalar(f"train_success(image)/P{k}", v, iloop)
+        logger.info(f"{iloop:0>5d} epsilon_agents: {_format_container(_calc_percentile(episode_info['epsilon_agents']))}")
         
         for i_agent, agent in enumerate(trainer.agents):
             agent_stat = agent.replay_buffer.stat()
@@ -1256,62 +1320,99 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
                 f"{_format_container(agent_stat)}"
             )
             for k, v in agent_stat['reward'].items():
-                summary_writer.add_scalar(f"train_reward_agent{i_agent:0>2d}/P{k}", v, episode)
+                summary_writer.add_scalar(f"train_reward_agent{i_agent:0>2d}/P{k}", v, iloop)
         
         target_q_stats = _calc_percentile(episode_info['target_q'])
-        logger.info(f"{episode:0>5d} target_q: {_format_container(target_q_stats)}") 
+        logger.info(f"{iloop:0>5d} target_q: {_format_container(target_q_stats)}") 
         
         target_net_out_stats = _calc_percentile(episode_info['target_net_out'])
-        logger.info(f"{episode:0>5d} target_net_out: {_format_container(target_net_out_stats)}") 
-          
-        if np.percentile(episode_info['success_agents'],80) >= 0.98:
-            target_range_step_last =  env_tr.next_target_range_step()
-            if target_range_step_last is not None:
-                trainer.reset_replay_buffer()  # clear buffer to remove sample from last curriculum 
-                logger.warning("reset replay buffer")       
-                p50 = np.percentile(episode_info['success_agents'],50)
-                p80 = np.percentile(episode_info['success_agents'],80)
-                p95 = np.percentile(episode_info['success_agents'],95)
-                logger.warning(f"target range step {target_range_step_last} | success agents (P50,P80,P95)=({p50:5.2f},{p80:5.2f},{p95:5.2f})")
-            else:
-                logger.warning("stop update target range step")
-                
+        logger.info(f"{iloop:0>5d} target_net_out: {_format_container(target_net_out_stats)}") 
+        logger.info(f"{iloop:0>5d} sampling ratio: {_format_container(episode_info['sampling_prob_agents'])}") 
+               
         for i_agent in range(env_tr.num_agents):
             for name in ['loss', 'entropy', 'reward_mean', 'reward_std','tderr_mean_smoothed_agents','tderr_std_agents','tderr_mean_agents']:
-                summary_writer.add_scalar(f"train_{name}_agent{i_agent:0>2d}", episode_info[name][i_agent], episode)
-            summary_writer.add_scalar(f"train_epsilon_agent{i_agent:0>3d}", trainer.agents[i_agent].epsilon, episode)
+                summary_writer.add_scalar(f"train_{name}_agent{i_agent:0>2d}", episode_info[name][i_agent], iloop)
+            summary_writer.add_scalar(f"train_epsilon_agent{i_agent:0>3d}", trainer.agents[i_agent].epsilon, iloop)
        
         # TODO: move this into env class
         env_tr.init_jitter = env_tr.init_jitter * env_tr.decay_jitter 
         if env_tr.init_jitter < 0.01:
             env_tr.init_jitter = 0.01
-        logger.info(
-            f"episode {episode:0>4d}|"
-            f"init jitter: {env_tr.init_jitter:3.2f}|"
-            f"loss: {_format_container(episode_info['loss'])}|"
-            f"ent: {_format_container(episode_info['entropy'])}")
-
+            
+        for agent in trainer.agents:
+            buffer = agent.replay_buffer
+            buffer.beta_remained *= buffer.beta_decay
+            buffer.beta = 1 - buffer.beta_remained
+            if buffer.beta > 1.0:
+                buffer.beta = 1.0
+                
+        success_ratio = np.percentile(episode_info['success_agents'],95) 
+        success_ratio_EAM += 0.1 * (success_ratio - success_ratio_EAM)
+        if success_ratio_EAM >= 0.9:
+            target_range_step_last =  env_tr.next_target_range_step()
+            if target_range_step_last is not None:
+                trainer.reset_replay_buffer()  # clear buffer to remove sample from last curriculum 
+                top_eval_metric = np.finfo("float").min
+                success_ratio_EAM = -100.0
+                logger.warning("reset replay buffer")       
+                p50 = np.percentile(episode_info['success_agents'],50)
+                p80 = np.percentile(episode_info['success_agents'],75)
+                p90 = np.percentile(episode_info['success_agents'],90)
+                logger.warning(f"{iloop:0>4d} target range step {target_range_step_last} | success agents (P50,P75,P90)=({p50:3.2f},{p80:3.2f},{p90:3.2f})")
+            else:
+                logger.warning(f"{iloop:0>4d} stop update target range step")
         
-        if episode % eval_freq == 0:
-            cv2.imwrite(os.path.join(outdir, f"{episode:0>8d}.jpg"), episode_info['visual_data'])
+        logger.info(
+            f"{iloop:0>4d}|"
+            f"init jitter: {env_tr.init_jitter:3.2f}|"
+            f"replay buffer beta: {trainer.agents[0].replay_buffer.beta:3.2f}"
+        )
+        logger.info(
+            f"loss: {_format_container(episode_info['loss'])}|"
+            f"ent: {_format_container(episode_info['entropy'])}"
+        )
+        logger.info(
+            f"EMA(success ratio): {success_ratio_EAM:3.2f}|"
+            f"success ratio: {success_ratio:3.2f}"
+            )
+
+        if iloop % eval_freq == 0:
+            cv2.imwrite(os.path.join(outdir, f"{iloop:0>8d}.jpg"), episode_info['visual_data'])
             trainer.save(os.path.join(outdir, "last.pth"))
             evaluater.load(os.path.join(outdir, "last.pth"))
             success_stat = evaluater.stat_success(env_te,sampling=1) # sampling > 1 to make eval faster
-            summary_writer.add_scalar("eval_success(image)/avg", success_stat['all'], episode)
-            summary_writer.add_scalar("eval_success(agents)/avg", success_stat['agents'], episode)
+            summary_writer.add_scalar("eval_success(image)/avg", success_stat['all'], iloop)
+            summary_writer.add_scalar("eval_success(agents)/avg", success_stat['agents'], iloop)
             logger.info(
-                f"episode {episode:0>4d}|"
-                f"eval sucess: {_format_container(success_stat['agents'])}"
+                f"{iloop:0>4d}|"
+                f"eval success(agents): {_format_container(success_stat['agents'])}|"
+                f"eval success(samples): {_format_container(success_stat['all'])}|"
                 )
-            for i in range(len(success_stat['agent_mask'])):
-                v = success_stat['agent_mask'][i]
-                logger.info(f"agent_{i:0>2d} succcess {v:3.2f}")
-            if success_stat['agents'] > top_eval_metric:
-                top_eval_metric = success_stat['agents']
+            
+            for i in range(trainer.num_agents):
+                success = np.mean(success_stat['agents_mask'][:,i])
+                entropy = np.mean(success_stat['agents_entropy'][:,i])
+                logger.info(f"\t agent_{i:0>2d} succcess {success:3.2f} entropy {entropy:3.2e}")
+                summary_writer.add_scalar(f"eval_success(agent{i})/avg", success, iloop)
+                summary_writer.add_scalar(f"eval_entropy(agent{i})/avg", entropy, iloop)
+            if success_stat['all'] > top_eval_metric:
+                top_eval_metric = success_stat['all']
                 logger.info(
-                    f"NEW BEST MODEL! Episode {episode}|"
-                    f"eval success: {success_stat['agents']:4.3f}")
+                    f"\t NEW BEST MODEL! training loop {iloop}|"
+                    f"eval success: {success_stat['all']:4.3f}")
                 evaluater.save(os.path.join(outdir, "best.pth"))
+            
+#            success_ratio = np.mean(success_stat['agent_mask'], axis=0)
+#            if np.mean(success_ratio) >= 0.8:
+#                target_range_step_last =  env_tr.next_target_range_step()
+#                if target_range_step_last is not None:
+#                    trainer.reset_replay_buffer()  # clear buffer to remove sample from last curriculum 
+#                    logger.warning("reset replay buffer")       
+#                    logger.warning(f"target range step {target_range_step_last} | success agents={_format_container(success_ratio)}")
+#                else:
+#                    logger.warning("stop update target range step")
+#    
+                
     logger.info(f"training stop with best metric {top_eval_metric}")
     trainer.save(os.path.join(outdir, "final.pth"))
 
@@ -1333,15 +1434,22 @@ class MARLEval(MARLBase):
                          use_weight_sharing=use_weight_sharing, flag_train=False,
                          agent_action_selection_mode=agent_action_selection_mode)
     def stat_success(self, env, sampling=1) -> dict:
-        success_stat = {"all":[], "agents":[], "agent_mask":[]}
+        success_stat = {"all":[], 
+                        "agents":[], 
+                        "agents_mask":[],
+                        "agents_entropy": []
+                        }
         for i_episode in tqdm(range(0,len(env),sampling),desc=f"eval with sampling={sampling}"):
             info = self.run_episode(env)
             success_stat['all'].append(info['success'])
             success_stat['agents'].append(info['success_agents'])
-            success_stat['agent_mask'].append(np.array(info['success_agent_mask']).reshape(1,-1)) 
+            success_stat['agents_mask'].append(np.array(info['success_agent_mask']).reshape(1,-1)) 
+            success_stat["agents_entropy"].append(np.array(info["entropy"]).reshape(1,-1))
         return {"all": np.mean(success_stat['all']), 
                 "agents": np.mean(success_stat['agents']), 
-                "agent_mask":np.mean(success_stat['agent_mask'],axis=0).flatten().tolist()}
+                "agents_mask":np.concat(success_stat['agents_mask'],axis=0),
+                "agents_entropy": np.concat(success_stat['agents_entropy'],axis=0)
+                }
 
     def run_episode(self, env, visual_mode="image", visual_size=256):
         # 重置环境，获取初始状态列表 [state_0, state_1, ..., state_k]
@@ -1396,7 +1504,7 @@ class MARLEval(MARLBase):
             assert False, f"invalid visual mode: {visual_mode}" 
              
         eval_info = {
-            "entropy": ent_agents_stat,
+            "entropy": np.reshape(ent_agents_stat,(1,-1)),
             "visual_data": visual_data_image,
             "reward_mean": np.mean(rewards_all, axis=0),
             "reward_std": np.std(rewards_all, axis=0),
@@ -1411,23 +1519,21 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     config_file = os.path.join(exp_dir, "cfg.toml")
     weights_file = os.path.join(exp_dir, 'last.pth')
     assert os.path.exists(config_file) and os.path.exists(weights_file)
-    with open(config_file, 'rb') as f:
-        cfg = tomllib.load(f)
-    seed = cfg.get("seed",42)
-    rng = set_seed(seed)
-    face_size = cfg.get("face_size", 512)
-    rf_size = cfg.get('rf_size', 64)
-    history_len = cfg.get("history_len", 5)
-    max_steps = cfg.get("max_steps", 1000)
-    actions = cfg.get("actions", [[1, 0], [-1, 0], [0, 1], [0, -1]])
-    reward_scale = cfg.get("reward_scale", 10.0)
-    dataset_size_max = cfg.get("dataset_size_max", None)
-    agent_xy_init_method = cfg.get("agent",{}).get("xy_init_method","random")
-    shared_patch_encoder = cfg.get("shared_patch_encoder", True)
-    use_abs_dist_as_reward = cfg.get("env",{}).get("use_abs_dist_as_reward",True) 
-    target_range_steps = cfg.get("training",{}).get("target_range_steps",(1,))
-    agent_action_selection_mode = cfg.get("agent_action_selection_mode", "dfs")
-    agent_use_global_view = cfg.get("agent",{}).get("use_global_view",False)
+    cfg = load_config(config_file)
+    rng = set_seed(cfg.training.seed)
+#    face_size = cfg.get("face_size", 512)
+#    rf_size = cfg.get('rf_size', 64)
+#    history_len = cfg.get("history_len", 5)
+#    max_steps = cfg.get("max_steps", 1000)
+#    actions = cfg.get("actions", [[1, 0], [-1, 0], [0, 1], [0, -1]])
+#    reward_scale = cfg.get("reward_scale", 10.0)
+#    dataset_size_max = cfg.get("dataset_size_max", None)
+#    agent_xy_init_method = cfg.get("agent",{}).get("xy_init_method","random")
+#    shared_patch_encoder = cfg.get("shared_patch_encoder", True)
+#    use_abs_dist_as_reward = cfg.get("env",{}).get("use_abs_dist_as_reward",True) 
+#    target_range_steps = cfg.get("training",{}).get("target_range_steps",(1,))
+#    agent_action_selection_mode = cfg.get("agent_action_selection_mode", "dfs")
+#    agent_use_global_view = cfg.get("agent",{}).get("use_global_view",False)
 
 
     outdir = os.path.join(exp_dir, "test")
@@ -1435,36 +1541,31 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
 
     logger.info(f"{cfg}")
     logger.info(f"saved folder {outdir}")
-    logger.info(f"actions: {actions}")
-    logger.info(f"dataset: {dataset_root}")
-    logger.info(f"use_abs_dist_as_reward: {use_abs_dist_as_reward}")
-    logger.info(f"target_range_steps: {target_range_steps}")
   
-    
-    
-    input_channels = 3 * history_len
-    if agent_use_global_view:
+    input_channels = 3 * cfg.env.history_len
+    if cfg.agent.use_global_view:
         input_channels += 3
-    input_shape = (1, input_channels, rf_size, rf_size)
-    n_actions = len(actions)
-    logger.info(f"face size: {face_size}") 
-    env = MARLEnv(dataset_root, split="test", face_size=face_size, rng=rng,
-                  rf_size=rf_size, history_len=history_len,
-                  actions=actions, reward_scale=reward_scale, dataset_size_max=dataset_size_max,
-                  max_steps=max_steps, 
-                  use_global_view=agent_use_global_view,
-                  agent_xy_init_method=agent_xy_init_method,
-                  use_abs_dist_as_reward=use_abs_dist_as_reward,
-                  target_range_steps=(target_range_steps[-1],))
+    input_shape = (1, input_channels, cfg.env.rf_size, cfg.env.rf_size)
+    n_actions = len(cfg.agent.actions)
+    env = MARLEnv(dataset_root, split="test", face_size=cfg.env.face_size, rng=rng,
+                  rf_size=cfg.env.rf_size, history_len=cfg.env.history_len,
+                  actions=cfg.agent.actions, 
+                  reward_scale=cfg.env.reward_scale, 
+                  dataset_size_max=cfg.env.dataset_size_max,
+                  max_steps=cfg.env.max_steps, 
+                  use_global_view=cfg.agent.use_global_view,
+                  agent_xy_init_method=cfg.agent.xy_init_method,
+                  use_abs_dist_as_reward=cfg.env.use_abs_dist_as_reward,
+                  target_range_steps=(cfg.training.target_range_steps[-1],))
     eval = MARLEval(
         num_agents=env.num_agents,
         input_shape=input_shape,
         n_actions=n_actions,
         device=device,
         rng = rng,
-        use_global_view=agent_use_global_view,
-        agent_action_selection_mode=agent_action_selection_mode,
-        use_weight_sharing=shared_patch_encoder
+        use_global_view=cfg.agent.use_global_view,
+        agent_action_selection_mode=cfg.agent.action_selection_mode,
+        use_weight_sharing=cfg.agent.shared_patch_encoder
         )
     logger.info(f"dataset size {len(env)}")
 
