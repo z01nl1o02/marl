@@ -10,14 +10,16 @@
 - [x] 分析 select_action 是否能覆盖解空间   
 - [x] 支持seed, 确保结果可复现
 - [x] Double DQN
+- [ ] decouple Q/V in network
 - [x] 统计 target_net 预测的取值范围,观察double DQN的效果
 - [ ] target network软跟新: Polyak
 - [x] 增加 td-err-mean, td-err-std 监控 target net 更新频率
-- [ ] 基于 td-err 设置 replay buffer 中样本权重
+- [x] 基于 td-err 设置 replay buffer 中样本权重
 - [ ] 验证 history_len 对训练的影响
 - [ ] 验证 epsilon_decay 对训练的影响
 - [x] 把全图缩放后，融入 agent 的输入信号，增加全局信息
 - [ ] 全图上标记自身位置,然后再融入obs
+- [x] 累计到一定数量样本之前，不用启动训练
 - [x] 使用 mean face 优化初始位置
 - [x] 共享 embeddding 层,只用一个Optimizer做更新共享层(使用多个 agent 对应 loss 的均值做backward)
 - [x] replay buffer中不要直接存储obs, 而是obs的索引，避免重复的帧被多次存储
@@ -30,6 +32,7 @@
 - [x] 每个 agent 单独统计成功率
 - [x] 支持 huber loss
 - [x] 统计 target_q 的取值范围, 缩放到合适的范围
+- [x] 对于success赋予一个足够的reward  !!milestone
 -----------------DEPERATED-----------------------------------------
 - [ ] replay buffer中存储image path + 坐标,动态生成obs 
 - [ ] replay buffer中obs采用uint8存储. 
@@ -109,13 +112,28 @@ def _calc_percentile(data:Iterable, P = (25,50,75,90)):
 
 class ReplayBuffer:
     def __init__(self, use_global_view:bool, capacity=10000, rng:None|np.random.Generator = None):
-        self.buffer = deque(maxlen=capacity)
+        
+        # TODO: move following into toml
+        self.max_priority = 10.0
+        self.alpha = 0.6
+        self.beta = 0.4
+        self.eps = 1e-6
+        
+        self.pos = 0
+        self.size = 0
+        self.buffer = [None] * capacity
+        self.priorities = np.zeros((capacity,),dtype=np.float32)
+        self.capacity = capacity
+        
         self.image_pool:dict[int, dict] = {}
         self.rng = rng if rng else np.random.default_rng(42)
         self.use_global_view = use_global_view
 
     def reset(self):
-        self.buffer.clear()
+        self.buffer = [None] * self.capacity
+        self.priorities = np.zeros((self.capacity,),dtype=np.float32)
+        self.pos = 0
+        self.size = 0
         self.image_pool.clear()
         
     def push(self, 
@@ -143,19 +161,25 @@ class ReplayBuffer:
         
         done = torch.FloatTensor(np.array([1 if done else 0])).unsqueeze(0)
         
-        self.buffer.append((image_id,state, action, reward, next_state, done))
+        self.buffer[self.pos] = (image_id,state, action, reward, next_state, done)
+        self.priorities[self.pos] = self.max_priority # assign max priority to latest sample
+        self.pos = (self.pos + 1) % self.capacity
+        self.size = (self.size + 1) % self.capacity
 
     def stat(self) -> dict[str,dict]:
         rewards_all, dones_all, actions_all = [], [], []
-        for i,s,a,r,ns,d in self.buffer:
+        priorites = []
+        for (i,s,a,r,ns,d), pr in zip(self.buffer[:self.size], self.priorities[:self.size]):
             rewards_all.append(r.item())
             dones_all.append(int(d.item()))
             actions_all.append(a.item())
+            priorites.append(pr)
         return {
             "total": len(self.buffer),
             "reward": _calc_percentile(rewards_all),
             "done": dict(Counter(dones_all)),
-            "image_pool": len(self.image_pool.keys())
+            "image_pool": len(self.image_pool.keys()),
+            "priority": _calc_percentile(priorites)
         } 
     
     def _recover_states(self, image_ids:list[int],states_xy:list[np.ndarray]) -> list[np.ndarray]:
@@ -186,7 +210,9 @@ class ReplayBuffer:
     def sample(self, batch_size)->tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,torch.Tensor, dict]:
         if batch_size > len(self.buffer):
             return (None,) * 6
-        indices = self.rng.choice(len(self.buffer), size=batch_size, replace=True)
+        p = self.priorities[:self.size] ** self.alpha # alpha < 0 to enhance low priority
+        probs = p / p.sum()
+        indices = self.rng.choice(self.size, size=batch_size, replace=True, p=probs)
         batch = [self.buffer[i] for i in indices]
         
         image_ids, states_xy, actions, rewards, next_states_xy, dones = zip(*batch)
@@ -204,10 +230,20 @@ class ReplayBuffer:
         next_states = torch.from_numpy(next_states)
         
         dones = torch.concat(dones,dim=0)
-        return states, actions, rewards, next_states, dones, {"indices":indices.copy()}
-
+        
+        # FIXME: adjust beta from 0.4 to 1.0
+        weights = (self.size * probs[indices]) ** (-self.beta)
+        weights = weights / weights.max()
+        return (states, actions, rewards, next_states, dones, 
+                {"indices":indices.copy(),
+                 "weights": weights.astype(np.float32)
+                 })
+    def update_priorities(self, indices, td_errors):
+        self.priorities[indices] = np.abs(td_errors) + self.eps
+        self.max_priority = max(self.max_priority, self.priorities[indices].max())
+        return
     def __len__(self):
-        return len(self.buffer)
+        return self.size
 
 class DatasetWFLW:
     # https://wywu.github.io/dataset/
@@ -548,8 +584,8 @@ class MARLEnv:
             obs_all.append(obs_agent)
             xy = np.concatenate([d for d in self.history_xy_agents[i_agent]], axis=1)
             xy_all.append(xy)
-        obs_data = np.concatenate(obs_all, axis=0)
-        xy_data = np.concatenate(xy_all,axis=0)
+        obs_data = np.concatenate(obs_all, axis=0).astype(np.float32)
+        xy_data = np.concatenate(xy_all,axis=0).astype(np.float32)
         return obs_data.copy(), xy_data
 
     def _take_actions(self, actions: list[int|None]) -> None:
@@ -593,6 +629,9 @@ class MARLEnv:
             
         target_range = self.target_range_steps[self.current_target_range_step_idx]
         success_mask = [dist_new[i] < target_range for i in range(self.num_agents)]
+        
+        # set a large reward value for successful agent
+        reward += 10 * np.asarray(success_mask)
        
         info = {"success": np.all(success_mask),
                 "num_steps": self.num_steps,
@@ -713,7 +752,7 @@ class Agent:
         self.rng = rng
         self.replay_buffer = ReplayBuffer(capacity=replay_buffer_size, 
                                           rng=rng, 
-                                          use_global_view=use_global_view)  # eat up memory!!! but have to be larger than max_step
+                                          use_global_view=use_global_view) 
 
         self.policy_net = CollabDQN(input_shape, n_actions, patch_encoder=shared_patch_encoder)
         self.policy_net.to(self.device)
@@ -889,9 +928,9 @@ class MARLTrain(MARLBase):
         self.agents_tderr_smoothed = [0.0 for _ in range(self.num_agents)]
         self.tderr_ema_beta = 0.99
         if training_loss.lower() == "huber":
-            self.loss_func = torch.nn.SmoothL1Loss(beta=1.0)
+            self.loss_func = torch.nn.HuberLoss(delta=1.0,reduction="none")
         elif training_loss.lower() == "mse":
-            self.loss_func = torch.nn.MSELoss()
+            self.loss_func = torch.nn.MSELoss(reduction="none")
         self.gamma = gamma
         self.use_double_dqn = use_double_dqn
     def reset_replay_buffer(self):
@@ -916,7 +955,7 @@ class MARLTrain(MARLBase):
                 optimizers_to_update += [self.optimizer]
             for iagent, (policy_net, target_net, optimizer, replay_buffer) in enumerate(nets_to_update):
                 # 从共享缓冲区采样
-                states, actions, rewards, next_states, dones,_ = replay_buffer.sample(batch_size)
+                states, actions, rewards, next_states, dones, batch_info = replay_buffer.sample(batch_size)
                 if states is None:
                     loss_agents.append(torch.zeros((1,),device=self.device))
                     continue # replay buffer中样本太少，直接跳过训练
@@ -947,13 +986,14 @@ class MARLTrain(MARLBase):
                 
                 agents_tderr_mean[iagent].append(torch.mean(tderr_agent).item())
                 agents_tderr_std[iagent].append(torch.std(tderr_agent).item())
+                replay_buffer.update_priorities(batch_info['indices'],tderr_agent.numpy().flatten())
                 self.agents_tderr_smoothed[iagent] = self.tderr_ema_beta * self.agents_tderr_smoothed[iagent] + (1-self.tderr_ema_beta) * agents_tderr_mean[iagent][-1]
                 
                 
-                loss_agent = self.loss_func(current_q, target_q)
-                
+                weights_gpu = torch.from_numpy(batch_info['weights']).to(self.device)
+                loss_agent = self.loss_func(current_q, target_q) * weights_gpu.reshape(-1,1)
                 optimizers_to_update.append(optimizer)  
-                loss_agents.append(loss_agent[None])
+                loss_agents.append(loss_agent.sum()[None])
             
             if optimizers_to_update != []:
                 for opt in optimizers_to_update:
@@ -1051,38 +1091,45 @@ class MARLTrain(MARLBase):
             else:
                 ent_agents_stat.append(np.mean(entropy_agents[i_agent]).item())
         # 4. 训练更新
-        train_info = self.train_step(batch_size=batch_size, update_steps=update_steps)
+        buffer_size = min([len(agent.replay_buffer) for agent in self.agents])
         
-        # 5. 衰减探索率
-        for agent in self.agents:
-            if agent.epsilon > agent.epsilon_min:
-                agent.epsilon *= agent.epsilon_decay
-            if agent.epsilon < agent.epsilon_min:
-                agent.epsilon = agent.epsilon_min
-                
-        # 6. 定期更新目标网络
-        if hasattr(self, 'episode_count'):
-            if self.episode_count % target_update_freq == 0:
-                logger.info("update target network")
-                for agent in self.agents:
-                    agent.update_target_network()
-        max_num_visual_data = min([env.max_steps, len(visual_data_all)])
-        visual_data_all = visual_data_all[-max_num_visual_data:]
-        vis_step = max([max_num_visual_data // 100,1])
-        visual_data_all = visual_data_all[::vis_step]
-        visual_data = torch.from_numpy(np.concatenate([np.transpose(d, (2, 0, 1))[None] for d in visual_data_all], axis=0))
-        visual_data_image = make_grid(visual_data, nrow=10, padding=5, normalize=False).permute(1, 2, 0).numpy()
-        del visual_data_all
-        gc.collect()
-        train_info.update(
-            {"entropy": ent_agents_stat, 
-             "visual_data": visual_data_image,
-             "reward_mean": np.mean(rewards_all, axis=0),
-             "reward_std": np.std(rewards_all, axis=0),
-             "success_agents": tuple(success_agents),
-             "epsilon_agents": tuple([a.epsilon for a in self.agents])
-             }
-        )
+        if buffer_size >= 1000: # TODO: move this to toml
+            train_info = self.train_step(batch_size=batch_size, update_steps=update_steps)
+       
+            # 5. 衰减探索率
+            for agent in self.agents:
+                if agent.epsilon > agent.epsilon_min:
+                    agent.epsilon *= agent.epsilon_decay
+                if agent.epsilon < agent.epsilon_min:
+                    agent.epsilon = agent.epsilon_min
+                    
+            # 6. 定期更新目标网络
+            if hasattr(self, 'episode_count'):
+                if self.episode_count % target_update_freq == 0:
+                    logger.info("update target network")
+                    for agent in self.agents:
+                        agent.update_target_network()
+            max_num_visual_data = min([env.max_steps, len(visual_data_all)])
+            visual_data_all = visual_data_all[-max_num_visual_data:]
+            vis_step = max([max_num_visual_data // 100,1])
+            visual_data_all = visual_data_all[::vis_step]
+            visual_data = torch.from_numpy(np.concatenate([np.transpose(d, (2, 0, 1))[None] for d in visual_data_all], axis=0))
+            visual_data_image = make_grid(visual_data, nrow=10, padding=5, normalize=False).permute(1, 2, 0).numpy()
+            del visual_data_all
+            gc.collect()
+            train_info.update(
+                {"entropy": ent_agents_stat, 
+                "visual_data": visual_data_image,
+                "reward_mean": np.mean(rewards_all, axis=0),
+                "reward_std": np.std(rewards_all, axis=0),
+                "success_agents": tuple(success_agents),
+                "epsilon_agents": tuple([a.epsilon for a in self.agents]),
+                "start_training": True,
+                "buffer_size": buffer_size
+                }
+            )
+        else:
+            train_info = {"start_training":False, 'buffer_size':buffer_size}
         return train_info
     
 def train(config_file: str, dataset_root: str, desc: str = "marl", device: str = "cuda:0", weights_file: str | None = None, eval_freq: int = 10):
@@ -1190,7 +1237,11 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
                                            batch_size=batch_size, 
                                            update_steps=update_steps,
                                            target_update_freq=target_update_freq)
-        
+      
+        if not episode_info['start_training']: # TODO: collect samples before episode-loop
+            buffer_size = episode_info['buffer_size']
+            logger.info(f"{episode:0>5d} training is not started| buffer size {buffer_size:5d}")
+            continue
         success_agents_percentile = _calc_percentile(episode_info['success_agents'])
         logger.info(f"{episode:0>5d} success_agents: {_format_container(success_agents_percentile)}")
         
