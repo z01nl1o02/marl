@@ -8,7 +8,7 @@
 
 [env]
 face_size = 512
-rf_size = 64
+rf_size = 128
 max_steps = 200
 #dataset_size_max = 300
 history_len = 2 #5

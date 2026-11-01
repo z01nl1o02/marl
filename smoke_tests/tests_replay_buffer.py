@@ -13,7 +13,7 @@ def test_states_identity():
     MAX_TEST_STEPS = 4 * MAX_STEPS
     BATCH_SIZE = 64
     rng = set_seed(42)
-    env = MARLEnv(dataset_root="D:\\dataset\\WFLW",split="train",rf_size=64, face_size=512,actions=ACTIONS,
+    env = MARLEnv(dataset_root="D:\\dataset\\WFLW",split="train",rf_size=64, face_size=512,actions=ACTIONS, flag_train=True,
                   target_range_steps=(10,5), use_abs_dist_as_reward=False, 
                   history_len=HISTORY_LEN,
                   max_steps = MAX_STEPS,

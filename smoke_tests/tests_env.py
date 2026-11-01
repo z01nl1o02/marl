@@ -9,7 +9,7 @@ def test_targets():
     import cv2
     from marl.src.main import MARLEnv
     actions = [(-1,0), (1,0), (0,1),(0,-1)]
-    env = MARLEnv(dataset_root="D:\\dataset\\WFLW",split="train",rf_size=64, face_size=512,actions=actions,
+    env = MARLEnv(dataset_root="D:\\dataset\\WFLW",split="train",rf_size=64, face_size=512,actions=actions,flag_train=True,
                   target_range_steps=(10,5), use_abs_dist_as_reward=False, history_len=5, 
                   dataset_size_max=64)
     env.reset()
@@ -23,7 +23,7 @@ def test_reward_range():
     face_size = 512
     actions = [(-2,0), (2,0), (0,2),(0,-2)]
     rng = np.random.default_rng(42)
-    env = MARLEnv(dataset_root="D:\\dataset\\WFLW",split="train",rf_size=64, face_size=face_size,actions=actions,
+    env = MARLEnv(dataset_root="D:\\dataset\\WFLW",split="train",rf_size=64, face_size=face_size,actions=actions,flag_train=True,
                   target_range_steps=(10,5), use_abs_dist_as_reward=False, history_len=5, 
                   dataset_size_max=64,rng=rng)
     env.reset()
