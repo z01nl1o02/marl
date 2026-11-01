@@ -740,27 +740,23 @@ class PatchEncoder(nn.Module):
     def __init__(self, shape_input: tuple[int, int, int, int]) -> None:
         super().__init__()
         B, C, H, W = shape_input
-        self.conv1 = nn.Conv2d(C, 32, kernel_size=5, stride=2)
+        self.conv1 = nn.Conv2d(C, 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=5, stride=2)
-        self.conv3 = nn.Conv2d(64,128, kernel_size=5, stride=2)
-        self.conv4 = nn.Conv2d(128,256, kernel_size=5, stride=2)
-        self.conv5 = nn.Conv2d(256,512, kernel_size=3, stride=1)
+        self.conv3 = nn.Conv2d(64,128, kernel_size=3, stride=2)
 
-        for conv in [self.conv1, self.conv2, self.conv3, self.conv4, self.conv5]:
+        for conv in [self.conv1, self.conv2, self.conv3]:
             torch.nn.init.xavier_normal_(conv.weight)
             torch.nn.init.zeros_(conv.bias)
          
         with torch.no_grad():
             dummy_input = torch.zeros(shape_input)
-            conv_final = self.conv5(self.conv4(self.conv3(self.conv2(self.conv1(dummy_input)))))
+            conv_final = self.conv3(self.conv2(self.conv1(dummy_input)))
             self.out_dim = conv_final.view(conv_final.size(0), -1).shape[-1]
 
     def forward(self, x): 
         x = torch.relu(self.conv1(x))
         x = torch.relu(self.conv2(x))
         x = torch.relu(self.conv3(x))
-        x = torch.relu(self.conv4(x))
-        x = torch.relu(self.conv5(x))
         x = x.view(x.size(0), -1)
         return x 
 
