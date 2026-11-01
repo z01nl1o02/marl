@@ -34,6 +34,6 @@ freezing_success_agent = true
 seed = 42
 num_loop = 5000 # 应该不低于 dataset_size_max
 loss = "huber" # huber, mse
-num_samples_to_enable_training = 100
+num_samples_to_enable_training = 1000
 
 

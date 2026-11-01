@@ -60,7 +60,7 @@ def test_exploit_explore():
             actions_selected = []
             dist2center = []
             for _ in range(max_step):
-                i_action = agent.select_action(None, xy_agent, actions)
+                i_action, _ = agent.select_action(None, xy_agent, actions)
                 actions_selected.append(i_action)
                 xy_agent[0] += actions[i_action][0]
                 xy_agent[1] += actions[i_action][1]

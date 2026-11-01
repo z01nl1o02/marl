@@ -12,6 +12,8 @@
 - [x] Double DQN
 - [x] 增大rf_size到128
 - [x] 提高模型复杂度
+- [x] 记录Q1-Q2,作为评估模型是否学习到知识点评估指标
+- [ ] 把路过target的次数作为一个 constant 层加入obs, 让 agent 观测到次数
 - [ ] decouple Q/V in network
 - [x] 统计 target_net 预测的取值范围,观察double DQN的效果
 - [ ] target network软跟新: Polyak
@@ -539,7 +541,7 @@ class MARLEnv:
         else:
             self.agent_xy_init_func = None 
 
-        self.min_steps_stay_within_target = 2 # TODO: 1. move it to TOML 2. encoding it as a new channel with constant value
+        self.min_steps_stay_within_target = 2 # TODO: 1. move it to TOML 2. encoding it as a new channel with constant value 3. should be smaller than history_len
         self.steps_stay_within_target_agents = np.zeros((self.num_agents,),dtype=np.int32)
         return
     
@@ -561,7 +563,7 @@ class MARLEnv:
         logit -= logit.min()
         p = (logit / logit.sum()).flatten()
         p = np.nan_to_num(p, nan=1.0 / (self.face_size * self.face_size))
-        xy = np.random.choice([k for k in range(self.face_size * self.face_size)], size=self.num_agents, p=p, replace=False)
+        xy = self.rng.choice([k for k in range(self.face_size * self.face_size)], size=self.num_agents, p=p, replace=False)
         x = xy % self.face_size
         y = xy // self.face_size
         self.xy_init_count[y, x] += 1
@@ -873,7 +875,9 @@ class Agent:
             # TODO: use exp-energy
             total = sum(visits)
             if total < 1.0:
-                return self.rng.choice([k for k in range(self.n_actions)],size=1).item(), {}
+                i_action = self.rng.choice([k for k in range(self.n_actions)],size=1).item()
+                self.explorer.set_visit(xys[i_action])
+                return i_action, {}
             if self.agent_action_selection_mode.lower() == "dfs":
                 p = [v / total for v in visits] # 深度优先
             elif self.agent_action_selection_mode.lower() == "bfs":
@@ -895,8 +899,12 @@ class Agent:
                 x, y = current_xy
                 nx, ny = int(actions[i_action][0] + x), int(actions[i_action][1] + y)
                 self.explorer.set_visit((nx, ny))
-                p = torch.softmax(q_values,dim=-1)
-                return i_action, {"entropy": (-p*torch.log(p)).sum().item()}
+                
+                top2 = torch.topk(q_values, k=2).values
+                q_gap = (top2[:,0] - top2[:,1]).item()
+                
+                log_p = torch.log_softmax(q_values - q_values.max(dim=-1).values[:,None],dim=-1)
+                return i_action, {"entropy": (-torch.exp(log_p)*log_p).sum().item(), "q_gap":q_gap}
 
     def update_target_network(self):
         self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -1310,7 +1318,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         trainer.load(weights_file)
         logger.warning(f"loading weights from {weights_file}")
         
-    success_ratio_EAM = 0.0 #
+    success_ratio_EAM = -100.0 #
 
     top_eval_metric = np.finfo("float").min
     for iloop in range(cfg.training.num_loop):
@@ -1414,9 +1422,11 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
             for i in range(trainer.num_agents):
                 success = np.mean(success_stat['agents_mask'][:,i])
                 entropy = np.mean(success_stat['agents_entropy'][:,i])
-                logger.info(f"\t agent_{i:0>2d} succcess {success:3.2f} entropy {entropy:3.2e}")
+                q_gap = np.mean(success_stat['agents_q_gap'][:,i])
+                logger.info(f"\t agent_{i:0>2d} succcess {success:3.2f} entropy {entropy:3.2f} q_gap {q_gap:4.3f}")
                 summary_writer.add_scalar(f"eval_success(agent{i})/avg", success, iloop)
                 summary_writer.add_scalar(f"eval_entropy(agent{i})/avg", entropy, iloop)
+                summary_writer.add_scalar(f"eval_q_gap(agent{i})/avg", q_gap, iloop)
             if success_stat['all'] > top_eval_metric:
                 top_eval_metric = success_stat['all']
                 logger.info(
@@ -1459,7 +1469,8 @@ class MARLEval(MARLBase):
         success_stat = {"all":[], 
                         "agents":[], 
                         "agents_mask":[],
-                        "agents_entropy": []
+                        "agents_entropy": [],
+                        "agents_q_gap": []
                         }
         for i_episode in tqdm(range(0,len(env),sampling),desc=f"eval with sampling={sampling}"):
             info = self.run_episode(env)
@@ -1467,10 +1478,12 @@ class MARLEval(MARLBase):
             success_stat['agents'].append(info['success_agents'])
             success_stat['agents_mask'].append(np.array(info['success_agent_mask']).reshape(1,-1)) 
             success_stat["agents_entropy"].append(np.array(info["entropy"]).reshape(1,-1))
+            success_stat['agents_q_gap'].append(np.array(info['q_gap']).reshape(1,-1))
         return {"all": np.mean(success_stat['all']), 
                 "agents": np.mean(success_stat['agents']), 
                 "agents_mask":np.concat(success_stat['agents_mask'],axis=0),
-                "agents_entropy": np.concat(success_stat['agents_entropy'],axis=0)
+                "agents_entropy": np.concat(success_stat['agents_entropy'],axis=0),
+                "agents_q_gap": np.concat(success_stat['agents_q_gap'],axis=0)
                 }
 
     def run_episode(self, env, visual_mode="image", visual_size=256):
@@ -1480,6 +1493,7 @@ class MARLEval(MARLBase):
         visual_data_all = [env.get_visual_data(size=visual_size)]
         rewards_all = []
         entropy_agents = [[] for _ in range(self.num_agents)]
+        q_gap_agents = [[] for _ in range(self.num_agents)]
         dxdy_all = np.zeros((self.num_agents, 2), dtype=np.float32)
         success: bool = False
         while True:
@@ -1491,6 +1505,8 @@ class MARLEval(MARLBase):
                 dxdy_all[i, :] += np.array(env.actions[action])
                 if 'entropy' in info:
                     entropy_agents[i].append(info['entropy']) 
+                if "q_gap" in  info:
+                    q_gap_agents[i].append(info['q_gap'])
             actions_all.append(np.array(actions).astype(np.int32).reshape(1, -1))
             
             # 2. 执行动作，与环境交互
@@ -1511,12 +1527,22 @@ class MARLEval(MARLBase):
 
         actions_all = np.concatenate(actions_all, axis=0)
         rewards_all = np.concatenate(rewards_all, axis=0)
+        
         ent_agents_stat = [0 for _ in range(self.num_agents)]
         for i_agent in range(self.num_agents):
             if entropy_agents[i_agent] == []:
                 ent_agents_stat[i_agent] = -99.0
             else:
                 ent_agents_stat[i_agent] = np.mean(entropy_agents[i_agent]).item()
+
+
+        q_gap_agents_stat = [0 for _ in range(self.num_agents)]
+        for i_agent in range(self.num_agents):
+            if q_gap_agents[i_agent] == []:
+                q_gap_agents_stat[i_agent] = -99.0
+            else:
+                q_gap_agents_stat[i_agent] = np.mean(q_gap_agents[i_agent]).item()
+                
         if visual_mode.lower() in {"image", "img"}:
             visual_data = torch.from_numpy(np.concatenate([np.transpose(d, (2, 0, 1))[None] for d in visual_data_all], axis=0))
             visual_data_image = make_grid(visual_data, nrow=10, padding=5, normalize=False).permute(1, 2, 0).numpy()
@@ -1526,6 +1552,7 @@ class MARLEval(MARLBase):
             assert False, f"invalid visual mode: {visual_mode}" 
              
         eval_info = {
+            "q_gap": np.reshape(q_gap_agents_stat,(1,-1)),
             "entropy": np.reshape(ent_agents_stat,(1,-1)),
             "visual_data": visual_data_image,
             "reward_mean": np.mean(rewards_all, axis=0),
@@ -1565,7 +1592,7 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
     logger.info(f"saved folder {outdir}")
   
     input_channels = 3 * cfg.env.history_len
-    if cfg.agent.use_global_view:
+    if cfg.env.use_global_view:
         input_channels += 3
     input_shape = (1, input_channels, cfg.env.rf_size, cfg.env.rf_size)
     n_actions = len(cfg.agent.actions)
@@ -1576,17 +1603,17 @@ def test(exp_dir, dataset_root, device: str = "cuda:0"):
                   reward_scale=cfg.env.reward_scale, 
                   dataset_size_max=cfg.env.dataset_size_max,
                   max_steps=cfg.env.max_steps, 
-                  use_global_view=cfg.agent.use_global_view,
+                  use_global_view=cfg.env.use_global_view,
                   agent_xy_init_method=cfg.agent.xy_init_method,
                   use_abs_dist_as_reward=cfg.env.use_abs_dist_as_reward,
-                  target_range_steps=(cfg.training.target_range_steps[-1],))
+                  target_range_steps=(cfg.env.target_range_steps[-1],))
     eval = MARLEval(
         num_agents=env.num_agents,
         input_shape=input_shape,
         n_actions=n_actions,
         device=device,
         rng = rng,
-        use_global_view=cfg.agent.use_global_view,
+        use_global_view=cfg.env.use_global_view,
         agent_action_selection_mode=cfg.agent.action_selection_mode,
         use_weight_sharing=cfg.agent.shared_patch_encoder
         )
