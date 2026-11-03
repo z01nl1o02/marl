@@ -97,6 +97,17 @@ def test_training_loop():
             for opt in optims_enabled:
                 opt.step()
 
+def test_ema_success():
+    for start in [-100,0.0]:
+        for alpha in [0.03,0.1, 0.5]:
+            step = 0
+            ema = start
+            while (ema < 0.9):
+                ema += alpha * (1.0 - ema)
+                step += 1
+            print(f"{start:5.1f}, {alpha:3.2f}, {step:5d}") 
+            
 if __name__ == "__main__":
-    test_training_loop()
+    #test_training_loop()
+    test_ema_success()
  

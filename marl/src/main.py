@@ -1314,7 +1314,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
         trainer.load(weights_file)
         logger.warning(f"loading weights from {weights_file}")
         
-    success_ratio_EAM = -100.0 #
+    success_ratio_EMA = 0.0 #
 
     top_eval_metric = np.finfo("float").min
     for iloop in range(cfg.training.num_loop):
@@ -1372,13 +1372,13 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
                 buffer.beta = 1.0
                 
         success_ratio = np.percentile(episode_info['success_agents'],95) 
-        success_ratio_EAM += 0.1 * (success_ratio - success_ratio_EAM)
-        if success_ratio_EAM >= 0.9:
+        success_ratio_EMA += 0.03 * (success_ratio - success_ratio_EMA)   # 66 loop each round
+        if success_ratio_EMA >= 0.9:
             target_range_step_last =  env_tr.next_target_range_step()
             if target_range_step_last is not None:
                 trainer.reset_replay_buffer()  # clear buffer to remove sample from last curriculum 
                 top_eval_metric = np.finfo("float").min
-                success_ratio_EAM = -100.0
+                success_ratio_EMA = 0
                 env_tr.init_jitter = 0.05 # TOOD: load from toml
                 logger.warning("reset replay buffer")       
                 p50 = np.percentile(episode_info['success_agents'],50)
@@ -1398,7 +1398,7 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
             f"ent: {_format_container(episode_info['entropy'])}"
         )
         logger.info(
-            f"EMA(success ratio): {success_ratio_EAM:3.2f}|"
+            f"EMA(success ratio): {success_ratio_EMA:3.2f}|"
             f"success ratio: {success_ratio:3.2f}"
             )
 
