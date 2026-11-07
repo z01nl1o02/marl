@@ -1257,8 +1257,8 @@ def train(config_file: str, dataset_root: str, desc: str = "marl", device: str =
     input_shape = (1, input_channels, cfg.env.rf_size, cfg.env.rf_size)
     n_actions = len(cfg.agent.actions)
     logger.info(f"face size: {cfg.env.face_size}") 
-    # FIXME: train net with trainset
-    env_tr = MARLEnv(dataset_root, split="test", rng=rng, face_size=cfg.env.face_size, 
+    # NOTE: heatmap model works bad on trainset, you may evaluate codes with testset
+    env_tr = MARLEnv(dataset_root, split="train", rng=rng, face_size=cfg.env.face_size, 
                      flag_train=True,
                      rf_size=cfg.env.rf_size, history_len=cfg.env.history_len,
                      actions=cfg.agent.actions, reward_scale=cfg.env.reward_scale,
